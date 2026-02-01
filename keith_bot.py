@@ -275,12 +275,12 @@ class KeithBot(discord.Client):
             return
         
         # Check for help command
-        if content_lower.startswith("khelp"):
+        if content_lower.startswith("k!help"):
             await self._handle_help(message)
             return
         
         # Check for purge command
-        if content_lower.startswith("kpurge"):
+        if content_lower.startswith("k!purge"):
             await self._handle_purge(message)
             return
         
@@ -400,8 +400,8 @@ class KeithBot(discord.Client):
 • `Keith clear` / `Keith reset` / `Keith forget` - Clear conversation history
 
 **Utility Commands:**
-• `khelp` - Show this help message
-• `kpurge <number>` - Delete the last N messages (max 100)
+• `k!help` - Show this help message
+• `k!purge <number>` - Delete the last N messages (max 100)
 • `ping @user` - Spam ping a user (count set in bot UI)
 """
         await message.channel.send(help_text)
@@ -414,13 +414,13 @@ class KeithBot(discord.Client):
         # Parse the number from the command
         parts = message.content.split()
         if len(parts) < 2:
-            await message.channel.send("Usage: `kpurge <number>` (e.g., `kpurge 10`)")
+            await message.channel.send("Usage: `k!purge <number>` (e.g., `k!purge 10`)")
             return
         
         try:
             count = int(parts[1])
         except ValueError:
-            await message.channel.send("Please provide a valid number. Usage: `kpurge <number>`")
+            await message.channel.send("Please provide a valid number. Usage: `k!purge <number>`")
             return
         
         # Limit the purge count for safety

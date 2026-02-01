@@ -1,8 +1,8 @@
 """
-Keith Discord Bot - An AI-powered Discord bot using OpenAI Assistants API.
+Keith Discord Bot - An AI-powered Discord bot using Anthropic's Claude API.
 
 Features:
-- "Keith <prompt>": Query the OpenAI Assistant
+- "Keith <prompt>": Query Claude AI with conversation memory per channel
 - "HalcM": Manual control mode for bot owner (requires tkinter)
 """
 
@@ -11,11 +11,10 @@ import logging
 import os
 import queue
 import threading
-import time
-from functools import partial
+from collections import defaultdict
 
+import anthropic
 import discord
-import openai
 from dotenv import load_dotenv
 
 # Optional tkinter import for HalcM feature
@@ -45,14 +44,24 @@ class Config:
     """Bot configuration loaded from environment variables."""
     
     BOT_TOKEN: str = os.getenv("DISCORD_BOT_TOKEN", "")
-    OPENAI_API_KEY: str = os.getenv("OPENAI_API_KEY", "")
-    ASSISTANT_ID: str = os.getenv("OPENAI_ASSISTANT_ID", "")
+    ANTHROPIC_API_KEY: str = os.getenv("ANTHROPIC_API_KEY", "")
+    CLAUDE_MODEL: str = os.getenv("CLAUDE_MODEL", "claude-sonnet-4-20250514")
     ALLOWED_USER_ID: int = int(os.getenv("ALLOWED_USER_ID", "0"))
     
-    # Runtime settings
-    MAX_POLL_TIME: int = 300  # seconds
-    POLL_INTERVAL: float = 1.5  # seconds
+    # System prompt for Keith's personality
+    SYSTEM_PROMPT: str = os.getenv(
+        "KEITH_SYSTEM_PROMPT",
+        "You are Keith, a helpful and friendly AI assistant in a Discord server. "
+        "Be conversational, helpful, and concise in your responses. "
+        "When recent channel messages are provided for context, you can reference them "
+        "to understand what users are discussing, but focus on answering the question asked of you."
+    )
+    
+    # Conversation settings
+    MAX_CONVERSATION_HISTORY: int = int(os.getenv("MAX_CONVERSATION_HISTORY", "20"))
+    RECENT_CHANNEL_MESSAGES: int = int(os.getenv("RECENT_CHANNEL_MESSAGES", "7"))
     DISCORD_MAX_LENGTH: int = 2000
+    MAX_TOKENS: int = 4096
     
     @classmethod
     def validate(cls) -> bool:
@@ -61,12 +70,10 @@ class Config:
         
         if not cls.BOT_TOKEN:
             errors.append("DISCORD_BOT_TOKEN is not set")
-        if not cls.OPENAI_API_KEY:
-            errors.append("OPENAI_API_KEY is not set")
-        if not cls.ASSISTANT_ID:
-            errors.append("OPENAI_ASSISTANT_ID is not set")
+        if not cls.ANTHROPIC_API_KEY:
+            errors.append("ANTHROPIC_API_KEY is not set")
         if cls.ALLOWED_USER_ID == 0:
-            errors.append("ALLOWED_USER_ID is not set (required for HalcM feature)")
+            logger.warning("ALLOWED_USER_ID is not set - HalcM feature will be disabled")
         
         if errors:
             logger.error("Configuration errors found:")
@@ -79,208 +86,126 @@ class Config:
 
 
 # =============================================================================
-# OpenAI Assistant Handler
+# Claude Assistant Handler
 # =============================================================================
 
-class AssistantHandler:
-    """Handles all OpenAI Assistant API interactions."""
+class ClaudeHandler:
+    """Handles all Claude API interactions with conversation memory."""
     
-    def __init__(self, api_key: str, assistant_id: str):
-        self.client = openai.OpenAI(api_key=api_key)
-        self.assistant_id = assistant_id
-        self.channel_threads: dict[int, str] = {}
+    def __init__(self, api_key: str, model: str, system_prompt: str):
+        self.client = anthropic.Anthropic(api_key=api_key)
+        self.model = model
+        self.system_prompt = system_prompt
+        # Store conversation history per channel: {channel_id: [messages]}
+        self.conversations: dict[int, list[dict]] = defaultdict(list)
     
-    async def verify_assistant(self) -> bool:
-        """Verify the assistant exists and is accessible."""
-        try:
-            loop = asyncio.get_event_loop()
-            assistant = await loop.run_in_executor(
-                None, 
-                self.client.beta.assistants.retrieve, 
-                self.assistant_id
-            )
-            logger.info(f"Connected to Assistant: {assistant.name} ({self.assistant_id})")
-            return True
-        except openai.NotFoundError:
-            logger.error(f"Assistant '{self.assistant_id}' not found. Check the ID.")
-        except openai.AuthenticationError:
-            logger.error("OpenAI authentication failed. Check your API key.")
-        except Exception as e:
-            logger.error(f"Failed to retrieve assistant: {e}")
-        return False
+    def clear_history(self, channel_id: int) -> None:
+        """Clear conversation history for a channel."""
+        self.conversations[channel_id] = []
+        logger.info(f"[Channel {channel_id}] Conversation history cleared")
     
-    def _get_or_create_thread(self, channel_id: int) -> str | None:
-        """Get existing thread or create a new one for a channel."""
-        if channel_id in self.channel_threads:
-            return self.channel_threads[channel_id]
-        
-        try:
-            thread = self.client.beta.threads.create()
-            self.channel_threads[channel_id] = thread.id
-            logger.info(f"[Channel {channel_id}] Created thread: {thread.id}")
-            return thread.id
-        except Exception as e:
-            logger.error(f"[Channel {channel_id}] Failed to create thread: {e}")
-            return None
+    def _trim_history(self, channel_id: int) -> None:
+        """Trim conversation history to max length."""
+        history = self.conversations[channel_id]
+        if len(history) > Config.MAX_CONVERSATION_HISTORY * 2:  # *2 for user+assistant pairs
+            # Keep only the most recent messages
+            self.conversations[channel_id] = history[-(Config.MAX_CONVERSATION_HISTORY * 2):]
     
-    def _clear_thread(self, channel_id: int) -> None:
-        """Remove a thread from the cache."""
-        self.channel_threads.pop(channel_id, None)
-    
-    async def process_prompt(self, channel_id: int, prompt: str) -> tuple[str | None, str | None]:
+    async def process_prompt(
+        self, 
+        channel_id: int, 
+        user_name: str, 
+        prompt: str,
+        recent_context: list[dict] | None = None
+    ) -> tuple[str | None, str | None]:
         """
-        Process a user prompt and return the assistant's response.
+        Process a user prompt and return Claude's response.
+        
+        Args:
+            channel_id: The Discord channel ID
+            user_name: Display name of the user asking
+            prompt: The user's prompt (after "Keith")
+            recent_context: Optional list of recent channel messages for context
         
         Returns:
             tuple: (response_text, error_message) - one will be None
         """
-        loop = asyncio.get_event_loop()
-        
-        # Get or create thread
-        thread_id = await loop.run_in_executor(
-            None, 
-            self._get_or_create_thread, 
-            channel_id
-        )
-        if not thread_id:
-            return None, "Sorry, I couldn't start a new conversation thread."
-        
-        logger.info(f"[Channel {channel_id}] Using thread: {thread_id}")
-        
-        # Add message to thread
-        try:
-            await loop.run_in_executor(
-                None,
-                partial(
-                    self.client.beta.threads.messages.create,
-                    thread_id=thread_id,
-                    role="user",
-                    content=prompt
-                )
+        # Build the user message with optional channel context
+        if recent_context:
+            context_text = "\n".join(
+                f"  [{msg['author']}]: {msg['content']}" 
+                for msg in recent_context
             )
-        except Exception as e:
-            if "no thread found" in str(e).lower() or "not_found" in str(e).lower():
-                self._clear_thread(channel_id)
-                return None, "Our conversation history was lost. Please try again to start a new one."
-            logger.error(f"[Channel {channel_id}] Failed to add message: {e}")
-            return None, "Sorry, I couldn't process your message."
-        
-        # Create and poll the run
-        try:
-            run = await loop.run_in_executor(
-                None,
-                partial(
-                    self.client.beta.threads.runs.create,
-                    thread_id=thread_id,
-                    assistant_id=self.assistant_id
-                )
+            full_content = (
+                f"[Recent channel messages for context]\n{context_text}\n\n"
+                f"[{user_name} asking you]: {prompt}"
             )
-            logger.info(f"[Channel {channel_id}] Created run: {run.id}")
+        else:
+            full_content = f"[{user_name}]: {prompt}"
+        
+        # Add user message to history
+        self.conversations[channel_id].append({
+            "role": "user",
+            "content": full_content
+        })
+        
+        # Trim history if needed
+        self._trim_history(channel_id)
+        
+        try:
+            # Make API call (run in executor to not block)
+            loop = asyncio.get_event_loop()
+            response = await loop.run_in_executor(
+                None,
+                self._call_claude,
+                channel_id
+            )
             
-            # Poll for completion
-            response = await self._poll_run(channel_id, thread_id, run.id)
-            return response
-            
-        except openai.RateLimitError:
-            logger.warning("OpenAI rate limit exceeded")
+            if response:
+                # Add assistant response to history
+                self.conversations[channel_id].append({
+                    "role": "assistant",
+                    "content": response
+                })
+                logger.info(f"[Channel {channel_id}] Got response ({len(response)} chars)")
+                return response, None
+            else:
+                # Remove the user message if we failed
+                self.conversations[channel_id].pop()
+                return None, "I received an empty response."
+                
+        except anthropic.RateLimitError:
+            self.conversations[channel_id].pop()  # Remove failed user message
+            logger.warning("Claude rate limit exceeded")
             return None, "Sorry, I'm getting too many requests. Please try again in a moment."
-        except openai.AuthenticationError:
-            logger.error("OpenAI authentication error during run")
+        except anthropic.AuthenticationError:
+            self.conversations[channel_id].pop()
+            logger.error("Claude authentication error")
             return None, "Sorry, there's an authentication issue. Please contact the bot owner."
-        except openai.NotFoundError:
-            logger.error(f"[Channel {channel_id}] Resource not found during run")
-            self._clear_thread(channel_id)
-            return None, "Sorry, the conversation context was lost. Please try again."
+        except anthropic.APIStatusError as e:
+            self.conversations[channel_id].pop()
+            logger.error(f"Claude API error: {e}")
+            return None, f"Sorry, there was an API error: {e.message}"
         except Exception as e:
+            self.conversations[channel_id].pop()
             logger.error(f"[Channel {channel_id}] Unexpected error: {e}")
             return None, "Sorry, an unexpected error occurred."
     
-    async def _poll_run(self, channel_id: int, thread_id: str, run_id: str) -> tuple[str | None, str | None]:
-        """Poll for run completion and retrieve the response."""
-        loop = asyncio.get_event_loop()
-        start_time = time.time()
+    def _call_claude(self, channel_id: int) -> str | None:
+        """Make the synchronous Claude API call."""
+        messages = self.conversations[channel_id]
         
-        while True:
-            # Check timeout
-            if time.time() - start_time > Config.MAX_POLL_TIME:
-                logger.warning(f"[Channel {channel_id}] Run timed out")
-                try:
-                    await loop.run_in_executor(
-                        None,
-                        partial(
-                            self.client.beta.threads.runs.cancel,
-                            thread_id=thread_id,
-                            run_id=run_id
-                        )
-                    )
-                except Exception:
-                    pass
-                return None, "Sorry, the request took too long to process."
-            
-            await asyncio.sleep(Config.POLL_INTERVAL)
-            
-            # Check run status
-            try:
-                run = await loop.run_in_executor(
-                    None,
-                    partial(
-                        self.client.beta.threads.runs.retrieve,
-                        thread_id=thread_id,
-                        run_id=run_id
-                    )
-                )
-            except openai.NotFoundError:
-                logger.error(f"[Channel {channel_id}] Run/thread not found during polling")
-                self._clear_thread(channel_id)
-                return None, "There was an issue tracking the AI's progress."
-            except Exception as e:
-                logger.warning(f"[Channel {channel_id}] Poll error: {e}")
-                await asyncio.sleep(3)
-                continue
-            
-            logger.debug(f"[Channel {channel_id}] Run status: {run.status}")
-            
-            if run.status == "completed":
-                return await self._get_assistant_response(channel_id, thread_id, run_id)
-            elif run.status in ["queued", "in_progress"]:
-                continue
-            else:
-                # Handle failed, cancelled, expired, requires_action
-                error_msg = f"Sorry, the process ended with status: {run.status}."
-                if run.last_error:
-                    error_msg += f" ({run.last_error.code}: {run.last_error.message})"
-                return None, error_msg[:1950]
-    
-    async def _get_assistant_response(self, channel_id: int, thread_id: str, run_id: str) -> tuple[str | None, str | None]:
-        """Retrieve the assistant's response from a completed run."""
-        loop = asyncio.get_event_loop()
+        response = self.client.messages.create(
+            model=self.model,
+            max_tokens=Config.MAX_TOKENS,
+            system=self.system_prompt,
+            messages=messages
+        )
         
-        try:
-            messages = await loop.run_in_executor(
-                None,
-                partial(
-                    self.client.beta.threads.messages.list,
-                    thread_id=thread_id,
-                    order="desc"
-                )
-            )
-            
-            # Find the assistant's response for this run
-            for msg in messages.data:
-                if msg.run_id == run_id and msg.role == "assistant":
-                    response_text = "".join(
-                        block.text.value 
-                        for block in msg.content 
-                        if block.type == "text"
-                    )
-                    logger.info(f"[Channel {channel_id}] Got response ({len(response_text)} chars)")
-                    return response_text or None, None if response_text else "I received an empty response."
-            
-            return None, "Sorry, I couldn't retrieve a response."
-            
-        except Exception as e:
-            logger.error(f"[Channel {channel_id}] Failed to get response: {e}")
-            return None, "Sorry, I couldn't retrieve the response."
+        # Extract text from response
+        if response.content and len(response.content) > 0:
+            return response.content[0].text
+        return None
 
 
 # =============================================================================
@@ -389,7 +314,11 @@ class KeithBot(discord.Client):
         intents.message_content = True
         super().__init__(intents=intents)
         
-        self.assistant = AssistantHandler(Config.OPENAI_API_KEY, Config.ASSISTANT_ID)
+        self.claude = ClaudeHandler(
+            Config.ANTHROPIC_API_KEY,
+            Config.CLAUDE_MODEL,
+            Config.SYSTEM_PROMPT
+        )
         self.manual_mode = ManualModeController()
     
     async def setup_hook(self) -> None:
@@ -399,17 +328,16 @@ class KeithBot(discord.Client):
     async def on_ready(self) -> None:
         """Called when the bot has connected to Discord."""
         logger.info(f"Logged in as {self.user}")
-        
-        # Verify OpenAI assistant connection
-        if not await self.assistant.verify_assistant():
-            logger.warning("Assistant verification failed - Keith commands may not work")
-        
+        logger.info(f"Using Claude model: {Config.CLAUDE_MODEL}")
         logger.info(f'Ready! Listening for "Keith" commands.')
         
-        if TKINTER_AVAILABLE:
+        if TKINTER_AVAILABLE and Config.ALLOWED_USER_ID != 0:
             logger.info(f'HalcM enabled for user ID: {Config.ALLOWED_USER_ID}')
         else:
-            logger.warning('HalcM disabled (tkinter not available)')
+            if not TKINTER_AVAILABLE:
+                logger.warning('HalcM disabled (tkinter not available)')
+            elif Config.ALLOWED_USER_ID == 0:
+                logger.warning('HalcM disabled (ALLOWED_USER_ID not set)')
     
     async def on_message(self, message: discord.Message) -> None:
         """Handle incoming messages."""
@@ -417,11 +345,17 @@ class KeithBot(discord.Client):
         if message.author == self.user:
             return
         
-        content_lower = message.content.lower()
+        content_lower = message.content.lower().strip()
         
         # Check for HalcM command
         if content_lower == "halcm":
             await self._handle_halcm(message)
+            return
+        
+        # Check for clear history command
+        if content_lower in ["keith clear", "keith reset", "keith forget"]:
+            self.claude.clear_history(message.channel.id)
+            await message.channel.send("Conversation history cleared! Starting fresh.")
             return
         
         # Ignore commands while manual mode is active in this channel
@@ -453,7 +387,7 @@ class KeithBot(discord.Client):
         if not self.manual_mode.activate(message.channel.id):
             try:
                 await message.channel.send(
-                    f"Manual mode is already active. Type `stop` in the popup to exit.",
+                    "Manual mode is already active. Type `stop` in the popup to exit.",
                     delete_after=15
                 )
                 await message.delete()
@@ -486,9 +420,17 @@ class KeithBot(discord.Client):
         
         logger.info(f"[Channel {message.channel.id}] Prompt from {message.author}: '{prompt[:50]}...'")
         
+        # Fetch recent channel messages for context
+        recent_context = await self._get_recent_messages(message)
+        
         # Process with typing indicator
         async with message.channel.typing():
-            response, error = await self.assistant.process_prompt(message.channel.id, prompt)
+            response, error = await self.claude.process_prompt(
+                message.channel.id,
+                message.author.display_name,
+                prompt,
+                recent_context
+            )
         
         # Send response or error
         if error:
@@ -497,6 +439,50 @@ class KeithBot(discord.Client):
             await self._send_long_message(message.channel, response)
         else:
             await message.channel.send("I received an empty response.")
+    
+    async def _get_recent_messages(self, trigger_message: discord.Message) -> list[dict] | None:
+        """
+        Fetch recent messages from the channel before the trigger message.
+        
+        This gives Keith context about what people were discussing,
+        so users can ask things like "Keith, what do you think about what User B said?"
+        """
+        if Config.RECENT_CHANNEL_MESSAGES <= 0:
+            return None
+        
+        try:
+            recent = []
+            async for msg in trigger_message.channel.history(
+                limit=Config.RECENT_CHANNEL_MESSAGES + 1,  # +1 because it includes the trigger
+                before=trigger_message
+            ):
+                # Skip bot's own messages and empty messages
+                if msg.author == self.user or not msg.content.strip():
+                    continue
+                
+                # Skip other Keith commands (don't include them as context)
+                if msg.content.lower().strip().startswith("keith"):
+                    continue
+                
+                recent.append({
+                    "author": msg.author.display_name,
+                    "content": msg.content[:500]  # Truncate very long messages
+                })
+            
+            # Reverse to get chronological order (oldest first)
+            recent.reverse()
+            
+            if recent:
+                logger.debug(f"[Channel {trigger_message.channel.id}] Got {len(recent)} recent messages for context")
+                return recent
+            return None
+            
+        except discord.Forbidden:
+            logger.warning(f"[Channel {trigger_message.channel.id}] No permission to read message history")
+            return None
+        except Exception as e:
+            logger.warning(f"[Channel {trigger_message.channel.id}] Failed to fetch recent messages: {e}")
+            return None
     
     async def _send_long_message(self, channel: discord.TextChannel, text: str) -> None:
         """Send a message, splitting if necessary for Discord's length limit."""

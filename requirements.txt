@@ -1,8 +1,8 @@
 # Discord Bot
 discord.py>=2.3.0
 
-# OpenAI
-openai>=1.0.0
+# Anthropic Claude API
+anthropic>=0.40.0
 
 # Environment Variables
 python-dotenv>=1.0.0

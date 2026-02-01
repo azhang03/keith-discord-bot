@@ -14,6 +14,7 @@ import queue
 import threading
 from collections import defaultdict
 from datetime import datetime
+from pathlib import Path
 
 import anthropic
 import customtkinter as ctk
@@ -341,55 +342,134 @@ class KeithBot(discord.Client):
         while True:
             try:
                 action, args = self._action_queue.get_nowait()
-                if action == "gather_voice":
-                    await self._gather_all_to_voice()
+                if action == "tomato_town":
+                    await self._tomato_town()
                 self._action_queue.task_done()
             except queue.Empty:
                 await asyncio.sleep(0.1)
             except Exception as e:
                 logger.error(f"Error processing action: {e}")
-                self.gui.log_chat(f"Action error: {e}", "error")
+                self.gui.log_console(f"Action error: {e}", "error")
     
-    async def _gather_all_to_voice(self) -> None:
-        """Move all users from all voice channels to the target channel."""
+    async def _tomato_town(self) -> None:
+        """
+        The Tomato Town sequence:
+        1. Move all users to the target voice channel
+        2. Join the voice channel
+        3. Play tomato.mp3
+        4. When audio ends, kick everyone and leave
+        """
         target_channel = self.get_channel(Config.GATHER_VOICE_CHANNEL_ID)
         
         if not target_channel:
-            self.gui.log_chat(f"Error: Target voice channel {Config.GATHER_VOICE_CHANNEL_ID} not found", "error")
+            self.gui.log_console(f"Error: Target voice channel {Config.GATHER_VOICE_CHANNEL_ID} not found", "error")
             return
         
         if not isinstance(target_channel, discord.VoiceChannel):
-            self.gui.log_chat(f"Error: Channel {Config.GATHER_VOICE_CHANNEL_ID} is not a voice channel", "error")
+            self.gui.log_console(f"Error: Channel {Config.GATHER_VOICE_CHANNEL_ID} is not a voice channel", "error")
             return
         
-        self.gui.log_system(f"Gathering everyone to #{target_channel.name}...")
+        # Step 1: Gather everyone to Tomato Town
+        self.gui.log_console(f"Gathering everyone to #{target_channel.name}...", "warning")
         
         moved_count = 0
-        failed_count = 0
+        members_to_kick = []  # Track members to kick later
         
         for guild in self.guilds:
             for voice_channel in guild.voice_channels:
-                # Skip the target channel itself
                 if voice_channel.id == Config.GATHER_VOICE_CHANNEL_ID:
+                    # Add existing members in target channel to kick list
+                    members_to_kick.extend(voice_channel.members)
                     continue
                 
-                # Move each member in this voice channel
                 for member in voice_channel.members:
                     try:
                         await member.move_to(target_channel)
-                        self.gui.log_system(f"Moved {member.display_name} from #{voice_channel.name} to #{target_channel.name}")
+                        self.gui.log_console(f"Moved {member.display_name} to #{target_channel.name}", "info")
+                        members_to_kick.append(member)
                         moved_count += 1
                     except discord.Forbidden:
-                        self.gui.log_chat(f"No permission to move {member.display_name}", "error")
-                        failed_count += 1
+                        self.gui.log_console(f"No permission to move {member.display_name}", "error")
                     except discord.HTTPException as e:
-                        self.gui.log_chat(f"Failed to move {member.display_name}: {e}", "error")
-                        failed_count += 1
+                        self.gui.log_console(f"Failed to move {member.display_name}: {e}", "error")
         
-        if moved_count > 0 or failed_count > 0:
-            self.gui.log_system(f"Gather complete: {moved_count} moved, {failed_count} failed")
-        else:
-            self.gui.log_system("No users found in other voice channels")
+        self.gui.log_console(f"Gathered {moved_count} users to Tomato Town", "success")
+        
+        # Step 2: Join the voice channel
+        try:
+            voice_client = await target_channel.connect()
+            self.gui.log_console(f"Keith joined #{target_channel.name}", "success")
+        except discord.ClientException:
+            # Already connected, get existing voice client
+            voice_client = target_channel.guild.voice_client
+            if voice_client and voice_client.channel != target_channel:
+                await voice_client.move_to(target_channel)
+            self.gui.log_console(f"Keith moved to #{target_channel.name}", "info")
+        except Exception as e:
+            self.gui.log_console(f"Failed to join voice: {e}", "error")
+            return
+        
+        # Step 3: Play tomato.mp3
+        audio_path = Path(__file__).parent / "audio" / "tomato.mp3"
+        
+        if not audio_path.exists():
+            self.gui.log_console(f"Error: Audio file not found at {audio_path}", "error")
+            await voice_client.disconnect()
+            return
+        
+        self.gui.log_console("Playing tomato.mp3...", "warning")
+        
+        # Create an event to signal when audio is done
+        audio_done = asyncio.Event()
+        
+        def after_playback(error):
+            if error:
+                logger.error(f"Playback error: {error}")
+            # Signal that audio is done
+            asyncio.run_coroutine_threadsafe(self._signal_event(audio_done), self.loop)
+        
+        try:
+            audio_source = discord.FFmpegPCMAudio(str(audio_path))
+            voice_client.play(audio_source, after=after_playback)
+            
+            # Wait for audio to finish
+            await audio_done.wait()
+            self.gui.log_console("Audio playback complete", "success")
+            
+        except Exception as e:
+            self.gui.log_console(f"Failed to play audio: {e}", "error")
+            self.gui.log_console("Make sure FFmpeg is installed on your system!", "warning")
+        
+        # Step 4: Kick everyone from the voice channel
+        self.gui.log_console("Kicking everyone from Tomato Town...", "warning")
+        
+        # Refresh the member list (some may have left)
+        target_channel = self.get_channel(Config.GATHER_VOICE_CHANNEL_ID)
+        kicked_count = 0
+        
+        if target_channel:
+            for member in list(target_channel.members):
+                if member == self.user:
+                    continue  # Don't kick ourselves yet
+                try:
+                    await member.move_to(None)  # Disconnect them
+                    self.gui.log_console(f"Kicked {member.display_name}", "info")
+                    kicked_count += 1
+                except discord.Forbidden:
+                    self.gui.log_console(f"No permission to kick {member.display_name}", "error")
+                except Exception as e:
+                    self.gui.log_console(f"Failed to kick {member.display_name}: {e}", "error")
+        
+        # Step 5: Leave the voice channel
+        if voice_client and voice_client.is_connected():
+            await voice_client.disconnect()
+            self.gui.log_console("Keith left the voice channel", "info")
+        
+        self.gui.log_console(f"Tomato Town complete! Kicked {kicked_count} users", "success")
+    
+    async def _signal_event(self, event: asyncio.Event) -> None:
+        """Helper to signal an event from a callback."""
+        event.set()
     
     def queue_action(self, action: str, args: dict = None) -> None:
         """Queue an action to be performed."""
@@ -461,17 +541,17 @@ class KeithGUI(ctk.CTk):
         )
         self.connect_btn.grid(row=0, column=2, padx=(15, 5), pady=10)
         
-        # Gather all to voice button
-        self.gather_btn = ctk.CTkButton(
+        # Tomato Town button
+        self.tomato_btn = ctk.CTkButton(
             self.status_frame,
-            text="Gather All",
-            command=self._gather_all_to_voice,
-            width=100,
-            fg_color="#7c3aed",
-            hover_color="#6d28d9",
+            text="Tomato Town",
+            command=self._tomato_town,
+            width=110,
+            fg_color="#dc2626",
+            hover_color="#b91c1c",
             state="disabled"
         )
-        self.gather_btn.grid(row=0, column=3, padx=(5, 15), pady=10)
+        self.tomato_btn.grid(row=0, column=3, padx=(5, 15), pady=10)
         
         # === Main Content Area (Two Panels Side by Side) ===
         self.content_frame = ctk.CTkFrame(self, fg_color="transparent")
@@ -630,13 +710,13 @@ class KeithGUI(ctk.CTk):
             self.message_entry.configure(state="normal")
             self.send_btn.configure(state="normal")
             self.channel_dropdown.configure(state="readonly")
-            self.gather_btn.configure(state="normal")
+            self.tomato_btn.configure(state="normal")
         else:
             self.connect_btn.configure(text="Connect")
             self.message_entry.configure(state="disabled")
             self.send_btn.configure(state="disabled")
             self.channel_dropdown.configure(state="disabled")
-            self.gather_btn.configure(state="disabled")
+            self.tomato_btn.configure(state="disabled")
     
     def populate_channels(self, channels: list[tuple[int, str, str]]) -> None:
         """Populate channel dropdown."""
@@ -800,13 +880,13 @@ class KeithGUI(ctk.CTk):
             self.bot.queue_message(channel_id, message)
             self.message_entry.delete(0, "end")
     
-    def _gather_all_to_voice(self) -> None:
-        """Trigger gathering all users to the target voice channel."""
+    def _tomato_town(self) -> None:
+        """Trigger the Tomato Town sequence."""
         if not self.bot or not self.bot._ready:
             return
         
-        self.log_system("Initiating voice channel gather...")
-        self.bot.queue_action("gather_voice")
+        self.log_console("Initiating Tomato Town...", "warning")
+        self.bot.queue_action("tomato_town")
     
     def _on_close(self) -> None:
         """Handle window close."""

@@ -125,20 +125,21 @@ class ClaudeHandler:
         
         prompt = f"""{context_text}New message from {author_name}: "{message_content}"
 
-Keith is an AI assistant in this Discord server. Should Keith respond to this message?
+Keith is an AI assistant bot in this Discord server. Should Keith respond to this message?
 
-Respond YES if ANY of these are true:
-- Keith's name is used to get his attention (e.g., "Keith", "hey Keith", "yo Keith")
-- The message is directed at Keith in any way
-- Someone is talking TO Keith, not just ABOUT Keith
-- It's a question, greeting, or statement aimed at Keith
-- Keith is being called, summoned, or addressed
+Respond YES if:
+- The message directly addresses Keith (e.g., "Keith how are you", "hey Keith", "yo Keith")
+- Someone is asking Keith a question or starting a conversation with him
+- Keith is being greeted, called, or summoned
 
-Respond NO only if:
-- People are clearly talking ABOUT Keith in third person without addressing him (e.g., "Keith is helpful", "I asked Keith earlier", "Keith said something funny")
-- Keith is mentioned as part of describing something, not as the recipient
+Respond NO if:
+- Someone is explaining, describing, or discussing what Keith does or how he works (e.g., "the keith bot detects...", "keith responds when...", "I programmed keith to...")
+- People are talking ABOUT Keith in third person (e.g., "Keith is helpful", "I asked Keith earlier", "thats just how keith is")
+- Keith is mentioned as part of an explanation or description to someone else
+- The message is directed at another person, not Keith
+- Someone is narrating or describing Keith's behavior/features
 
-When in doubt, respond YES. Keith would rather respond when not needed than ignore someone trying to talk to him.
+The key question: Is the person trying to START or CONTINUE a conversation WITH Keith, or are they talking ABOUT Keith to someone else?
 
 Reply with only YES or NO."""
 
@@ -273,6 +274,16 @@ class KeithBot(discord.Client):
             self.gui.clear_chat_log()
             return
         
+        # Check for purge command
+        if content_lower.startswith("!purge"):
+            await self._handle_purge(message)
+            return
+        
+        # Check for ping command
+        if content_lower.startswith("ping <@"):
+            await self._handle_spam_ping(message)
+            return
+        
         # Smart detection mode: check if "keith" appears anywhere and is relevant
         if self.smart_detection:
             if "keith" in content_lower:
@@ -374,6 +385,97 @@ class KeithBot(discord.Client):
             self.gui.log_chat(f"[#{channel_name}] Keith: {response}", "keith")
         else:
             await message.channel.send("I received an empty response.")
+    
+    async def _handle_purge(self, message: discord.Message) -> None:
+        """Handle the purge command to delete messages."""
+        channel_name = getattr(message.channel, 'name', 'DM')
+        
+        # Parse the number from the command
+        parts = message.content.split()
+        if len(parts) < 2:
+            await message.channel.send("Usage: `!purge <number>` (e.g., `!purge 10`)")
+            return
+        
+        try:
+            count = int(parts[1])
+        except ValueError:
+            await message.channel.send("Please provide a valid number. Usage: `!purge <number>`")
+            return
+        
+        # Limit the purge count for safety
+        if count < 1:
+            await message.channel.send("Please provide a number greater than 0.")
+            return
+        if count > 100:
+            await message.channel.send("For safety, you can only purge up to 100 messages at a time.")
+            count = 100
+        
+        # Check if the bot has permission to manage messages
+        if not message.channel.permissions_for(message.guild.me).manage_messages:
+            await message.channel.send("I don't have permission to delete messages. I need the 'Manage Messages' permission.")
+            self.gui.log_console(f"[#{channel_name}] Purge failed - missing permissions", "error")
+            return
+        
+        try:
+            # Delete the command message first, then purge
+            # purge() will delete `count` messages (not including the command since we delete it separately)
+            await message.delete()
+            deleted = await message.channel.purge(limit=count)
+            
+            # Send confirmation (will auto-delete after 3 seconds)
+            confirm_msg = await message.channel.send(f"Purged {len(deleted)} messages.")
+            await asyncio.sleep(3)
+            await confirm_msg.delete()
+            
+            self.gui.log_console(f"[#{channel_name}] Purged {len(deleted)} messages (requested by {message.author.display_name})", "warning")
+            
+        except discord.Forbidden:
+            await message.channel.send("I don't have permission to delete messages.")
+            self.gui.log_console(f"[#{channel_name}] Purge failed - forbidden", "error")
+        except discord.HTTPException as e:
+            await message.channel.send(f"Failed to purge messages: {e}")
+            self.gui.log_console(f"[#{channel_name}] Purge failed - {e}", "error")
+    
+    async def _handle_spam_ping(self, message: discord.Message) -> None:
+        """Handle the spam ping command."""
+        channel_name = getattr(message.channel, 'name', 'DM')
+        
+        # Extract the user mention from the message
+        # Format: "ping <@userid>" or "ping <@!userid>"
+        import re
+        match = re.search(r'<@!?(\d+)>', message.content)
+        if not match:
+            await message.channel.send("Usage: `ping <@user>`")
+            return
+        
+        user_mention = match.group(0)  # The full mention like <@123456>
+        
+        # Get ping count from GUI
+        ping_count = self.gui.get_spam_ping_count()
+        
+        # Delete the command message
+        try:
+            await message.delete()
+        except discord.Forbidden:
+            pass
+        
+        self.gui.log_console(f"[#{channel_name}] Spam pinging {user_mention} {ping_count} times (requested by {message.author.display_name})", "warning")
+        
+        # Spam ping
+        for i in range(ping_count):
+            try:
+                ping_msg = await message.channel.send(user_mention)
+                await asyncio.sleep(0.3)  # Brief delay
+                await ping_msg.delete()
+                await asyncio.sleep(0.2)  # Brief delay between pings
+            except discord.Forbidden:
+                self.gui.log_console(f"[#{channel_name}] Spam ping failed - no permission", "error")
+                break
+            except discord.HTTPException as e:
+                self.gui.log_console(f"[#{channel_name}] Spam ping error - {e}", "error")
+                break
+        
+        self.gui.log_console(f"[#{channel_name}] Spam ping complete", "success")
     
     async def _get_recent_messages(self, trigger_message: discord.Message) -> list[dict] | None:
         """Fetch recent messages from the channel for context."""
@@ -820,9 +922,43 @@ class KeithGUI(ctk.CTk):
         self.tomato_msg_entry.insert(0, "Tomato Town Massacre")
         # Don't grid yet - will be shown when toggle is on
         
+        # === Spam Ping Section ===
+        self.spam_ping_frame = ctk.CTkFrame(self)
+        self.spam_ping_frame.grid(row=3, column=0, sticky="ew", padx=10, pady=5)
+        
+        self.spam_ping_label = ctk.CTkLabel(
+            self.spam_ping_frame,
+            text="Spam Ping:",
+            font=("Arial", 12)
+        )
+        self.spam_ping_label.grid(row=0, column=0, padx=(15, 10), pady=12)
+        
+        self.spam_ping_info = ctk.CTkLabel(
+            self.spam_ping_frame,
+            text="Use 'ping @user' in Discord",
+            font=("Arial", 11),
+            text_color="#8b949e"
+        )
+        self.spam_ping_info.grid(row=0, column=1, padx=(0, 15), pady=12)
+        
+        self.spam_ping_count_label = ctk.CTkLabel(
+            self.spam_ping_frame,
+            text="Count:",
+            font=("Arial", 12)
+        )
+        self.spam_ping_count_label.grid(row=0, column=2, padx=(15, 5), pady=12)
+        
+        self.spam_ping_count_entry = ctk.CTkEntry(
+            self.spam_ping_frame,
+            width=60,
+            justify="center"
+        )
+        self.spam_ping_count_entry.insert(0, "5")
+        self.spam_ping_count_entry.grid(row=0, column=3, padx=(0, 15), pady=12)
+        
         # === Manual Message Section (Bottom) ===
         self.input_frame = ctk.CTkFrame(self)
-        self.input_frame.grid(row=3, column=0, sticky="ew", padx=10, pady=(5, 10))
+        self.input_frame.grid(row=4, column=0, sticky="ew", padx=10, pady=(5, 10))
         self.input_frame.grid_columnconfigure(1, weight=1)
         
         # Channel selector
@@ -891,6 +1027,14 @@ class KeithGUI(ctk.CTk):
             self.channel_dropdown.set(display_names[0])
         else:
             self.channel_dropdown.configure(values=["No channels available"])
+    
+    def get_spam_ping_count(self) -> int:
+        """Get the spam ping count from the UI."""
+        try:
+            count = int(self.spam_ping_count_entry.get())
+            return max(1, min(count, 50))  # Clamp between 1 and 50
+        except ValueError:
+            return 5  # Default
     
     def log_console(self, message: str, level: str = "info") -> None:
         """Add a message to the console log."""

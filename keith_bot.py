@@ -274,13 +274,16 @@ class KeithBot(discord.Client):
             self.gui.clear_chat_log()
             return
         
+        # Get the command prefix from GUI
+        prefix = self.gui.get_prefix().lower()
+        
         # Check for help command
-        if content_lower.startswith("k!help"):
+        if content_lower.startswith(f"{prefix}help"):
             await self._handle_help(message)
             return
         
         # Check for purge command
-        if content_lower.startswith("k!purge"):
+        if content_lower.startswith(f"{prefix}purge"):
             await self._handle_purge(message)
             return
         
@@ -393,15 +396,16 @@ class KeithBot(discord.Client):
     
     async def _handle_help(self, message: discord.Message) -> None:
         """Handle the help command to list available commands."""
-        help_text = """**Keith Bot Commands**
+        prefix = self.gui.get_prefix()
+        help_text = f"""**Keith Bot Commands**
 
 **Chat with Keith:**
 • `Keith <message>` - Talk to Keith (or just mention him with Smart Detection on)
 • `Keith clear` / `Keith reset` / `Keith forget` - Clear conversation history
 
 **Utility Commands:**
-• `k!help` - Show this help message
-• `k!purge <number>` - Delete the last N messages (max 100)
+• `{prefix}help` - Show this help message
+• `{prefix}purge <number>` - Delete the last N messages (max 100)
 • `ping @user` - Spam ping a user (count set in bot UI)
 """
         await message.channel.send(help_text)
@@ -410,17 +414,18 @@ class KeithBot(discord.Client):
     async def _handle_purge(self, message: discord.Message) -> None:
         """Handle the purge command to delete messages."""
         channel_name = getattr(message.channel, 'name', 'DM')
+        prefix = self.gui.get_prefix()
         
         # Parse the number from the command
         parts = message.content.split()
         if len(parts) < 2:
-            await message.channel.send("Usage: `k!purge <number>` (e.g., `k!purge 10`)")
+            await message.channel.send(f"Usage: `{prefix}purge <number>` (e.g., `{prefix}purge 10`)")
             return
         
         try:
             count = int(parts[1])
         except ValueError:
-            await message.channel.send("Please provide a valid number. Usage: `k!purge <number>`")
+            await message.channel.send(f"Please provide a valid number. Usage: `{prefix}purge <number>`")
             return
         
         # Limit the purge count for safety
@@ -798,7 +803,23 @@ class KeithGUI(ctk.CTk):
             onvalue=True,
             offvalue=False
         )
-        self.smart_detection_toggle.grid(row=0, column=3, padx=(10, 15), pady=10)
+        self.smart_detection_toggle.grid(row=0, column=3, padx=(10, 10), pady=10)
+        
+        # Command prefix
+        self.prefix_label = ctk.CTkLabel(
+            self.status_frame,
+            text="Prefix:",
+            font=("Arial", 12)
+        )
+        self.prefix_label.grid(row=0, column=4, padx=(10, 5), pady=10)
+        
+        self.prefix_entry = ctk.CTkEntry(
+            self.status_frame,
+            width=50,
+            justify="center"
+        )
+        self.prefix_entry.insert(0, "k!")
+        self.prefix_entry.grid(row=0, column=5, padx=(0, 15), pady=10)
         
         # === Main Content Area (Two Panels Side by Side) ===
         self.content_frame = ctk.CTkFrame(self, fg_color="transparent")
@@ -1056,6 +1077,11 @@ class KeithGUI(ctk.CTk):
             return max(1, min(count, 50))  # Clamp between 1 and 50
         except ValueError:
             return 5  # Default
+    
+    def get_prefix(self) -> str:
+        """Get the command prefix from the UI."""
+        prefix = self.prefix_entry.get().strip()
+        return prefix if prefix else "k!"  # Default to k! if empty
     
     def log_console(self, message: str, level: str = "info") -> None:
         """Add a message to the console log."""

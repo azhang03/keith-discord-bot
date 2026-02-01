@@ -62,6 +62,9 @@ class Config:
     # Voice channel to gather everyone into
     GATHER_VOICE_CHANNEL_ID: int = int(os.getenv("GATHER_VOICE_CHANNEL_ID", "1084054075613659206"))
     
+    # Super Server voice channel
+    SUPER_SERVER_CHANNEL_ID: int = int(os.getenv("SUPER_SERVER_CHANNEL_ID", "1279678245201121300"))
+    
     # FFmpeg path (if not in system PATH)
     FFMPEG_PATH: str = os.getenv("FFMPEG_PATH", "")
     
@@ -127,19 +130,21 @@ class ClaudeHandler:
 
 Keith is an AI assistant bot in this Discord server. Should Keith respond to this message?
 
-Respond YES if:
-- The message directly addresses Keith (e.g., "Keith how are you", "hey Keith", "yo Keith")
-- Someone is asking Keith a question or starting a conversation with him
-- Keith is being greeted, called, or summoned
+Respond YES if ANY of these are true:
+- The message contains a question and mentions Keith (e.g., "what do I do keith?", "any tips keith?", "keith what should I do?")
+- Someone is asking Keith for advice, help, or his opinion
+- The message is conversational and includes Keith's name as part of talking TO him
+- Keith's name appears with words like "hey", "yo", "bro", or other casual addresses
+- The sentence structure suggests they want Keith's input (questions, requests for advice)
+- Keith is being asked something, even casually (e.g., "im bored keith what do I do")
 
-Respond NO if:
-- Someone is explaining, describing, or discussing what Keith does or how he works (e.g., "the keith bot detects...", "keith responds when...", "I programmed keith to...")
-- People are talking ABOUT Keith in third person (e.g., "Keith is helpful", "I asked Keith earlier", "thats just how keith is")
-- Keith is mentioned as part of an explanation or description to someone else
-- The message is directed at another person, not Keith
-- Someone is narrating or describing Keith's behavior/features
+Respond NO only if:
+- Someone is explaining or describing how Keith works as a bot (e.g., "the keith bot detects...", "I programmed keith to...")
+- People are clearly talking ABOUT Keith to someone else in third person (e.g., "Keith is helpful", "thats just how keith is", "I asked keith earlier")
+- Keith is mentioned as part of a technical explanation or description
+- The message is a statement about Keith, not a message TO Keith
 
-The key question: Is the person trying to START or CONTINUE a conversation WITH Keith, or are they talking ABOUT Keith to someone else?
+Key insight: If the message contains a QUESTION and mentions Keith, the person almost certainly wants Keith to answer. When in doubt with questions, say YES.
 
 Reply with only YES or NO."""
 
@@ -240,6 +245,8 @@ class KeithBot(discord.Client):
         self._action_queue: queue.Queue = queue.Queue()  # For actions like voice moves
         self._ready = False
         self.smart_detection = False  # Toggle for AI-based relevance detection
+        self.super_server_active = False  # Toggle for Super Server mode
+        self._super_server_voice_client: discord.VoiceClient | None = None
     
     async def setup_hook(self) -> None:
         """Start background tasks."""
@@ -590,6 +597,10 @@ class KeithBot(discord.Client):
                 action, args = self._action_queue.get_nowait()
                 if action == "tomato_town":
                     await self._tomato_town()
+                elif action == "super_server_start":
+                    await self._super_server_start()
+                elif action == "super_server_stop":
+                    await self._super_server_stop()
                 self._action_queue.task_done()
             except queue.Empty:
                 await asyncio.sleep(0.1)
@@ -722,6 +733,111 @@ class KeithBot(discord.Client):
     async def _signal_event(self, event: asyncio.Event) -> None:
         """Helper to signal an event from a callback."""
         event.set()
+    
+    async def _super_server_start(self) -> None:
+        """
+        Start Super Server mode:
+        1. Join the Super Server voice channel
+        2. Loop dd.mp3 indefinitely
+        """
+        target_channel = self.get_channel(Config.SUPER_SERVER_CHANNEL_ID)
+        
+        if not target_channel:
+            self.gui.log_console(f"Error: Super Server channel {Config.SUPER_SERVER_CHANNEL_ID} not found", "error")
+            self.gui.after(0, self.gui._reset_super_server_toggle)
+            return
+        
+        if not isinstance(target_channel, discord.VoiceChannel):
+            self.gui.log_console(f"Error: Channel {Config.SUPER_SERVER_CHANNEL_ID} is not a voice channel", "error")
+            self.gui.after(0, self.gui._reset_super_server_toggle)
+            return
+        
+        # Check if audio file exists
+        audio_path = Path(__file__).parent / "audio" / "dd.mp3"
+        if not audio_path.exists():
+            self.gui.log_console(f"Error: Audio file not found at {audio_path}", "error")
+            self.gui.after(0, self.gui._reset_super_server_toggle)
+            return
+        
+        # Join the voice channel
+        try:
+            self._super_server_voice_client = await target_channel.connect()
+            self.gui.log_console(f"Keith joined #{target_channel.name} for Super Server", "success")
+        except discord.ClientException:
+            # Already connected somewhere, try to move
+            for vc in self.voice_clients:
+                if vc.guild == target_channel.guild:
+                    await vc.move_to(target_channel)
+                    self._super_server_voice_client = vc
+                    self.gui.log_console(f"Keith moved to #{target_channel.name} for Super Server", "info")
+                    break
+        except Exception as e:
+            self.gui.log_console(f"Failed to join voice for Super Server: {e}", "error")
+            self.gui.after(0, self.gui._reset_super_server_toggle)
+            return
+        
+        self.super_server_active = True
+        self.gui.log_console("Super Server activated - looping dd.mp3", "success")
+        
+        # Start looping the audio
+        self._play_super_server_audio()
+    
+    def _play_super_server_audio(self) -> None:
+        """Play dd.mp3 and loop it when finished."""
+        if not self.super_server_active or not self._super_server_voice_client:
+            return
+        
+        if not self._super_server_voice_client.is_connected():
+            self.gui.log_console("Super Server: Voice client disconnected", "warning")
+            self.super_server_active = False
+            self.gui.after(0, self.gui._reset_super_server_toggle)
+            return
+        
+        audio_path = Path(__file__).parent / "audio" / "dd.mp3"
+        
+        def after_playback(error):
+            if error:
+                logger.error(f"Super Server playback error: {error}")
+            # Loop: schedule next play if still active
+            if self.super_server_active:
+                asyncio.run_coroutine_threadsafe(
+                    self._schedule_super_server_loop(), 
+                    self.loop
+                )
+        
+        try:
+            if Config.FFMPEG_PATH:
+                ffmpeg_exe = os.path.join(Config.FFMPEG_PATH, "ffmpeg.exe")
+                audio_source = discord.FFmpegPCMAudio(str(audio_path), executable=ffmpeg_exe)
+            else:
+                audio_source = discord.FFmpegPCMAudio(str(audio_path))
+            
+            self._super_server_voice_client.play(audio_source, after=after_playback)
+        except Exception as e:
+            self.gui.log_console(f"Super Server audio error: {e}", "error")
+            self.super_server_active = False
+            self.gui.after(0, self.gui._reset_super_server_toggle)
+    
+    async def _schedule_super_server_loop(self) -> None:
+        """Schedule the next loop of Super Server audio."""
+        if self.super_server_active:
+            self._play_super_server_audio()
+    
+    async def _super_server_stop(self) -> None:
+        """Stop Super Server mode and leave the voice channel."""
+        self.super_server_active = False
+        
+        if self._super_server_voice_client:
+            if self._super_server_voice_client.is_playing():
+                self._super_server_voice_client.stop()
+            
+            if self._super_server_voice_client.is_connected():
+                await self._super_server_voice_client.disconnect()
+                self.gui.log_console("Keith left Super Server voice channel", "info")
+            
+            self._super_server_voice_client = None
+        
+        self.gui.log_console("Super Server deactivated", "success")
     
     def queue_action(self, action: str, args: dict = None) -> None:
         """Queue an action to be performed."""
@@ -924,14 +1040,22 @@ class KeithGUI(ctk.CTk):
         self.memory_log._textbox.tag_config("context_author", foreground="#8b949e")  # Gray for context authors
         self.memory_log._textbox.tag_config("context_msg", foreground="#6e7681")     # Dimmer gray for context text
         
-        # === Tomato Town Section ===
-        self.tomato_frame = ctk.CTkFrame(self)
-        self.tomato_frame.grid(row=2, column=0, sticky="ew", padx=10, pady=5)
-        self.tomato_frame.grid_columnconfigure(3, weight=1)
+        # === Memes Section ===
+        self.memes_frame = ctk.CTkFrame(self)
+        self.memes_frame.grid(row=2, column=0, sticky="ew", padx=10, pady=5)
+        self.memes_frame.grid_columnconfigure(5, weight=1)
+        
+        # Memes section label
+        self.memes_label = ctk.CTkLabel(
+            self.memes_frame,
+            text="Memes:",
+            font=("Arial", 12, "bold")
+        )
+        self.memes_label.grid(row=0, column=0, padx=(15, 10), pady=12)
         
         # Tomato Town button
         self.tomato_btn = ctk.CTkButton(
-            self.tomato_frame,
+            self.memes_frame,
             text="Tomato Town",
             command=self._tomato_town,
             width=120,
@@ -941,28 +1065,52 @@ class KeithGUI(ctk.CTk):
             font=("Arial", 13, "bold"),
             state="disabled"
         )
-        self.tomato_btn.grid(row=0, column=0, padx=(15, 10), pady=12)
+        self.tomato_btn.grid(row=0, column=1, padx=(0, 10), pady=12)
         
         # Toggle for sending message
         self.tomato_msg_var = ctk.BooleanVar(value=False)
         self.tomato_msg_toggle = ctk.CTkSwitch(
-            self.tomato_frame,
+            self.memes_frame,
             text="Send message",
             variable=self.tomato_msg_var,
             command=self._toggle_tomato_message,
             onvalue=True,
             offvalue=False
         )
-        self.tomato_msg_toggle.grid(row=0, column=1, padx=(10, 10), pady=12)
+        self.tomato_msg_toggle.grid(row=0, column=2, padx=(10, 10), pady=12)
         
         # Message entry (hidden by default)
         self.tomato_msg_entry = ctk.CTkEntry(
-            self.tomato_frame,
+            self.memes_frame,
             placeholder_text="Message to send...",
-            width=300
+            width=200
         )
         self.tomato_msg_entry.insert(0, "Tomato Town Massacre")
         # Don't grid yet - will be shown when toggle is on
+        
+        # Separator
+        self.memes_separator = ctk.CTkLabel(
+            self.memes_frame,
+            text="|",
+            font=("Arial", 16),
+            text_color="#484f58"
+        )
+        self.memes_separator.grid(row=0, column=4, padx=(15, 15), pady=12)
+        
+        # Super Server toggle button
+        self.super_server_active = False
+        self.super_server_btn = ctk.CTkButton(
+            self.memes_frame,
+            text="Super Server",
+            command=self._toggle_super_server,
+            width=120,
+            height=36,
+            fg_color="#7c3aed",
+            hover_color="#6d28d9",
+            font=("Arial", 13, "bold"),
+            state="disabled"
+        )
+        self.super_server_btn.grid(row=0, column=5, padx=(0, 15), pady=12)
         
         # === Spam Ping Section ===
         self.spam_ping_frame = ctk.CTkFrame(self)
@@ -1053,12 +1201,17 @@ class KeithGUI(ctk.CTk):
             self.send_btn.configure(state="normal")
             self.channel_dropdown.configure(state="readonly")
             self.tomato_btn.configure(state="normal")
+            self.super_server_btn.configure(state="normal")
         else:
             self.connect_btn.configure(text="Connect")
             self.message_entry.configure(state="disabled")
             self.send_btn.configure(state="disabled")
             self.channel_dropdown.configure(state="disabled")
             self.tomato_btn.configure(state="disabled")
+            self.super_server_btn.configure(state="disabled")
+            # Reset super server state if disconnected
+            if self.super_server_active:
+                self._reset_super_server_toggle()
     
     def populate_channels(self, channels: list[tuple[int, str, str]]) -> None:
         """Populate channel dropdown."""
@@ -1180,9 +1333,44 @@ class KeithGUI(ctk.CTk):
     def _toggle_tomato_message(self) -> None:
         """Show/hide the tomato message entry based on toggle state."""
         if self.tomato_msg_var.get():
-            self.tomato_msg_entry.grid(row=0, column=3, sticky="ew", padx=(10, 15), pady=12)
+            self.tomato_msg_entry.grid(row=0, column=3, sticky="ew", padx=(10, 0), pady=12)
         else:
             self.tomato_msg_entry.grid_remove()
+    
+    def _toggle_super_server(self) -> None:
+        """Toggle Super Server mode on/off."""
+        if not self.bot or not self.bot._ready:
+            return
+        
+        if not self.super_server_active:
+            # Turn ON
+            self.super_server_active = True
+            self.super_server_btn.configure(
+                text="Stop Server",
+                fg_color="#dc2626",
+                hover_color="#b91c1c"
+            )
+            self.log_console("Starting Super Server...", "warning")
+            self.bot.queue_action("super_server_start")
+        else:
+            # Turn OFF
+            self.super_server_active = False
+            self.super_server_btn.configure(
+                text="Super Server",
+                fg_color="#7c3aed",
+                hover_color="#6d28d9"
+            )
+            self.log_console("Stopping Super Server...", "info")
+            self.bot.queue_action("super_server_stop")
+    
+    def _reset_super_server_toggle(self) -> None:
+        """Reset the Super Server button to OFF state (called on error or disconnect)."""
+        self.super_server_active = False
+        self.super_server_btn.configure(
+            text="Super Server",
+            fg_color="#7c3aed",
+            hover_color="#6d28d9"
+        )
     
     def _toggle_smart_detection(self) -> None:
         """Toggle smart detection mode on/off."""

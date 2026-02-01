@@ -42,6 +42,7 @@ class Config:
     BOT_TOKEN: str = os.getenv("DISCORD_BOT_TOKEN", "")
     ANTHROPIC_API_KEY: str = os.getenv("ANTHROPIC_API_KEY", "")
     CLAUDE_MODEL: str = os.getenv("CLAUDE_MODEL", "claude-sonnet-4-20250514")
+    RELEVANCE_MODEL: str = os.getenv("RELEVANCE_MODEL", "claude-3-5-haiku-20241022")
     
     # System prompt for Keith's personality
     SYSTEM_PROMPT: str = os.getenv(
@@ -60,6 +61,9 @@ class Config:
     
     # Voice channel to gather everyone into
     GATHER_VOICE_CHANNEL_ID: int = int(os.getenv("GATHER_VOICE_CHANNEL_ID", "1084054075613659206"))
+    
+    # FFmpeg path (if not in system PATH)
+    FFMPEG_PATH: str = os.getenv("FFMPEG_PATH", "")
     
     @classmethod
     def validate(cls) -> list[str]:
@@ -82,6 +86,7 @@ class ClaudeHandler:
     def __init__(self, api_key: str, model: str, system_prompt: str):
         self.client = anthropic.Anthropic(api_key=api_key)
         self.model = model
+        self.relevance_model = Config.RELEVANCE_MODEL
         self.system_prompt = system_prompt
         self.conversations: dict[int, list[dict]] = defaultdict(list)
     
@@ -98,6 +103,59 @@ class ClaudeHandler:
         history = self.conversations[channel_id]
         if len(history) > Config.MAX_CONVERSATION_HISTORY * 2:
             self.conversations[channel_id] = history[-(Config.MAX_CONVERSATION_HISTORY * 2):]
+    
+    def check_relevance(
+        self, 
+        message_content: str, 
+        author_name: str,
+        recent_context: list[dict] | None = None
+    ) -> tuple[bool, str | None]:
+        """
+        Check if a message mentioning Keith is relevant for Keith to respond to.
+        Uses a fast model (Haiku) to minimize latency and cost.
+        Returns (should_respond, error).
+        """
+        # Build context for the relevance check
+        context_text = ""
+        if recent_context:
+            context_text = "Recent messages:\n" + "\n".join(
+                f"  {msg['author']}: {msg['content']}" 
+                for msg in recent_context[-5:]  # Only last 5 for relevance check
+            ) + "\n\n"
+        
+        prompt = f"""{context_text}New message from {author_name}: "{message_content}"
+
+Keith is an AI assistant in this Discord server. Should Keith respond to this message?
+
+Respond YES if ANY of these are true:
+- Keith's name is used to get his attention (e.g., "Keith", "hey Keith", "yo Keith")
+- The message is directed at Keith in any way
+- Someone is talking TO Keith, not just ABOUT Keith
+- It's a question, greeting, or statement aimed at Keith
+- Keith is being called, summoned, or addressed
+
+Respond NO only if:
+- People are clearly talking ABOUT Keith in third person without addressing him (e.g., "Keith is helpful", "I asked Keith earlier", "Keith said something funny")
+- Keith is mentioned as part of describing something, not as the recipient
+
+When in doubt, respond YES. Keith would rather respond when not needed than ignore someone trying to talk to him.
+
+Reply with only YES or NO."""
+
+        try:
+            response = self.client.messages.create(
+                model=self.relevance_model,
+                max_tokens=10,
+                messages=[{"role": "user", "content": prompt}]
+            )
+            
+            if response.content and len(response.content) > 0:
+                answer = response.content[0].text.strip().upper()
+                return answer.startswith("YES"), None
+            return False, "Empty response"
+            
+        except Exception as e:
+            return False, str(e)
     
     def process_prompt(
         self, 
@@ -180,6 +238,7 @@ class KeithBot(discord.Client):
         self._message_queue: queue.Queue = queue.Queue()
         self._action_queue: queue.Queue = queue.Queue()  # For actions like voice moves
         self._ready = False
+        self.smart_detection = False  # Toggle for AI-based relevance detection
     
     async def setup_hook(self) -> None:
         """Start background tasks."""
@@ -214,12 +273,71 @@ class KeithBot(discord.Client):
             self.gui.clear_chat_log()
             return
         
-        # Check for Keith command
-        if content_lower.startswith("keith"):
-            await self._handle_keith(message)
+        # Smart detection mode: check if "keith" appears anywhere and is relevant
+        if self.smart_detection:
+            if "keith" in content_lower:
+                await self._handle_keith_smart(message)
+        else:
+            # Classic mode: only respond if message starts with "keith"
+            if content_lower.startswith("keith"):
+                await self._handle_keith(message)
+    
+    async def _handle_keith_smart(self, message: discord.Message) -> None:
+        """Handle messages mentioning Keith with AI relevance check."""
+        channel_name = getattr(message.channel, 'name', 'DM')
+        
+        # Fetch recent context for relevance check
+        recent_context = await self._get_recent_messages(message)
+        
+        # Run relevance check in executor to not block
+        loop = asyncio.get_event_loop()
+        should_respond, error = await loop.run_in_executor(
+            None,
+            self.claude.check_relevance,
+            message.content,
+            message.author.display_name,
+            recent_context
+        )
+        
+        if error:
+            self.gui.log_console(f"[#{channel_name}] Relevance check error: {error}", "error")
+            return
+        
+        if not should_respond:
+            self.gui.log_console(f"[#{channel_name}] Skipped (not relevant): {message.content[:50]}...", "info")
+            return
+        
+        # It's relevant - proceed with response using full message as prompt
+        self.gui.log_console(f"[#{channel_name}] Detected relevant mention", "success")
+        
+        # Log recent context to memory panel first (if any)
+        if recent_context:
+            self.gui.log_context(channel_name, recent_context)
+        
+        # Log the user's message
+        self.gui.log_chat(f"[#{channel_name}] {message.author.display_name}: {message.content}", "user")
+        
+        async with message.channel.typing():
+            response, error = await loop.run_in_executor(
+                None,
+                self.claude.process_prompt,
+                message.channel.id,
+                message.author.display_name,
+                message.content,  # Use full message as prompt
+                recent_context
+            )
+        
+        if error:
+            await message.channel.send(f"Sorry, an error occurred: {error}")
+            self.gui.log_chat(f"[#{channel_name}] Error: {error}", "error")
+        elif response:
+            await self._send_long_message(message.channel, response)
+            self.gui.log_chat(f"[#{channel_name}] Keith: {response}", "keith")
+        else:
+            await message.channel.send("I received an empty response.")
     
     async def _handle_keith(self, message: discord.Message) -> None:
-        """Handle the Keith AI command."""
+        """Handle the Keith AI command (classic mode - starts with 'Keith')."""
         prompt = message.content[5:].strip()
         if not prompt:
             return
@@ -429,7 +547,13 @@ class KeithBot(discord.Client):
             asyncio.run_coroutine_threadsafe(self._signal_event(audio_done), self.loop)
         
         try:
-            audio_source = discord.FFmpegPCMAudio(str(audio_path))
+            # Use custom FFmpeg path if configured
+            ffmpeg_options = {}
+            if Config.FFMPEG_PATH:
+                ffmpeg_exe = os.path.join(Config.FFMPEG_PATH, "ffmpeg.exe")
+                audio_source = discord.FFmpegPCMAudio(str(audio_path), executable=ffmpeg_exe)
+            else:
+                audio_source = discord.FFmpegPCMAudio(str(audio_path))
             voice_client.play(audio_source, after=after_playback)
             
             # Wait for audio to finish
@@ -539,19 +663,19 @@ class KeithGUI(ctk.CTk):
             command=self._toggle_connection,
             width=100
         )
-        self.connect_btn.grid(row=0, column=2, padx=(15, 5), pady=10)
+        self.connect_btn.grid(row=0, column=2, padx=(15, 10), pady=10)
         
-        # Tomato Town button
-        self.tomato_btn = ctk.CTkButton(
+        # Smart detection toggle
+        self.smart_detection_var = ctk.BooleanVar(value=False)
+        self.smart_detection_toggle = ctk.CTkSwitch(
             self.status_frame,
-            text="Tomato Town",
-            command=self._tomato_town,
-            width=110,
-            fg_color="#dc2626",
-            hover_color="#b91c1c",
-            state="disabled"
+            text="Smart Detection",
+            variable=self.smart_detection_var,
+            command=self._toggle_smart_detection,
+            onvalue=True,
+            offvalue=False
         )
-        self.tomato_btn.grid(row=0, column=3, padx=(5, 15), pady=10)
+        self.smart_detection_toggle.grid(row=0, column=3, padx=(10, 15), pady=10)
         
         # === Main Content Area (Two Panels Side by Side) ===
         self.content_frame = ctk.CTkFrame(self, fg_color="transparent")
@@ -656,9 +780,49 @@ class KeithGUI(ctk.CTk):
         self.memory_log._textbox.tag_config("context_author", foreground="#8b949e")  # Gray for context authors
         self.memory_log._textbox.tag_config("context_msg", foreground="#6e7681")     # Dimmer gray for context text
         
+        # === Tomato Town Section ===
+        self.tomato_frame = ctk.CTkFrame(self)
+        self.tomato_frame.grid(row=2, column=0, sticky="ew", padx=10, pady=5)
+        self.tomato_frame.grid_columnconfigure(3, weight=1)
+        
+        # Tomato Town button
+        self.tomato_btn = ctk.CTkButton(
+            self.tomato_frame,
+            text="Tomato Town",
+            command=self._tomato_town,
+            width=120,
+            height=36,
+            fg_color="#dc2626",
+            hover_color="#b91c1c",
+            font=("Arial", 13, "bold"),
+            state="disabled"
+        )
+        self.tomato_btn.grid(row=0, column=0, padx=(15, 10), pady=12)
+        
+        # Toggle for sending message
+        self.tomato_msg_var = ctk.BooleanVar(value=False)
+        self.tomato_msg_toggle = ctk.CTkSwitch(
+            self.tomato_frame,
+            text="Send message",
+            variable=self.tomato_msg_var,
+            command=self._toggle_tomato_message,
+            onvalue=True,
+            offvalue=False
+        )
+        self.tomato_msg_toggle.grid(row=0, column=1, padx=(10, 10), pady=12)
+        
+        # Message entry (hidden by default)
+        self.tomato_msg_entry = ctk.CTkEntry(
+            self.tomato_frame,
+            placeholder_text="Message to send...",
+            width=300
+        )
+        self.tomato_msg_entry.insert(0, "Tomato Town Massacre")
+        # Don't grid yet - will be shown when toggle is on
+        
         # === Manual Message Section (Bottom) ===
         self.input_frame = ctk.CTkFrame(self)
-        self.input_frame.grid(row=2, column=0, sticky="ew", padx=10, pady=(5, 10))
+        self.input_frame.grid(row=3, column=0, sticky="ew", padx=10, pady=(5, 10))
         self.input_frame.grid_columnconfigure(1, weight=1)
         
         # Channel selector
@@ -822,6 +986,24 @@ class KeithGUI(ctk.CTk):
         self._clear_console_logs()
         self._erase_memory()
     
+    def _toggle_tomato_message(self) -> None:
+        """Show/hide the tomato message entry based on toggle state."""
+        if self.tomato_msg_var.get():
+            self.tomato_msg_entry.grid(row=0, column=3, sticky="ew", padx=(10, 15), pady=12)
+        else:
+            self.tomato_msg_entry.grid_remove()
+    
+    def _toggle_smart_detection(self) -> None:
+        """Toggle smart detection mode on/off."""
+        enabled = self.smart_detection_var.get()
+        if self.bot:
+            self.bot.smart_detection = enabled
+        
+        if enabled:
+            self.log_console("Smart Detection ON: Keith will respond to relevant mentions", "success")
+        else:
+            self.log_console("Smart Detection OFF: Keith only responds to 'Keith <message>'", "info")
+    
     def _toggle_connection(self) -> None:
         """Connect or disconnect the bot."""
         if self.bot and self.bot._ready:
@@ -845,6 +1027,7 @@ class KeithGUI(ctk.CTk):
         self.log_system("Starting bot...")
         
         self.bot = KeithBot(self)
+        self.bot.smart_detection = self.smart_detection_var.get()  # Sync toggle state
         
         def run_bot():
             try:
@@ -884,6 +1067,22 @@ class KeithGUI(ctk.CTk):
         """Trigger the Tomato Town sequence."""
         if not self.bot or not self.bot._ready:
             return
+        
+        # Send message if toggle is enabled
+        if self.tomato_msg_var.get():
+            message = self.tomato_msg_entry.get().strip()
+            if message:
+                # Get selected channel
+                selection = self.channel_dropdown.get()
+                channel_id = None
+                for cid, name, guild in self.channels:
+                    if f"#{name} ({guild})" == selection:
+                        channel_id = cid
+                        break
+                
+                if channel_id:
+                    self.bot.queue_message(channel_id, message)
+                    self.log_console(f"Sent message: {message}", "info")
         
         self.log_console("Initiating Tomato Town...", "warning")
         self.bot.queue_action("tomato_town")

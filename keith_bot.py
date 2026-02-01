@@ -274,8 +274,13 @@ class KeithBot(discord.Client):
             self.gui.clear_chat_log()
             return
         
+        # Check for help command
+        if content_lower.startswith("khelp"):
+            await self._handle_help(message)
+            return
+        
         # Check for purge command
-        if content_lower.startswith("!purge"):
+        if content_lower.startswith("kpurge"):
             await self._handle_purge(message)
             return
         
@@ -386,6 +391,22 @@ class KeithBot(discord.Client):
         else:
             await message.channel.send("I received an empty response.")
     
+    async def _handle_help(self, message: discord.Message) -> None:
+        """Handle the help command to list available commands."""
+        help_text = """**Keith Bot Commands**
+
+**Chat with Keith:**
+• `Keith <message>` - Talk to Keith (or just mention him with Smart Detection on)
+• `Keith clear` / `Keith reset` / `Keith forget` - Clear conversation history
+
+**Utility Commands:**
+• `khelp` - Show this help message
+• `kpurge <number>` - Delete the last N messages (max 100)
+• `ping @user` - Spam ping a user (count set in bot UI)
+"""
+        await message.channel.send(help_text)
+        self.gui.log_console(f"[#{getattr(message.channel, 'name', 'DM')}] Help requested by {message.author.display_name}", "info")
+    
     async def _handle_purge(self, message: discord.Message) -> None:
         """Handle the purge command to delete messages."""
         channel_name = getattr(message.channel, 'name', 'DM')
@@ -393,13 +414,13 @@ class KeithBot(discord.Client):
         # Parse the number from the command
         parts = message.content.split()
         if len(parts) < 2:
-            await message.channel.send("Usage: `!purge <number>` (e.g., `!purge 10`)")
+            await message.channel.send("Usage: `kpurge <number>` (e.g., `kpurge 10`)")
             return
         
         try:
             count = int(parts[1])
         except ValueError:
-            await message.channel.send("Please provide a valid number. Usage: `!purge <number>`")
+            await message.channel.send("Please provide a valid number. Usage: `kpurge <number>`")
             return
         
         # Limit the purge count for safety

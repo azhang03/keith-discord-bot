@@ -131,20 +131,20 @@ class ClaudeHandler:
 Keith is an AI assistant bot in this Discord server. Should Keith respond to this message?
 
 Respond YES if ANY of these are true:
-- The message contains a question and mentions Keith (e.g., "what do I do keith?", "any tips keith?", "keith what should I do?")
+- The message contains a question and mentions Keith
 - Someone is asking Keith for advice, help, or his opinion
-- The message is conversational and includes Keith's name as part of talking TO him
-- Keith's name appears with words like "hey", "yo", "bro", or other casual addresses
-- The sentence structure suggests they want Keith's input (questions, requests for advice)
-- Keith is being asked something, even casually (e.g., "im bored keith what do I do")
+- The message is conversational and directed AT Keith (uses "you/your" when talking about Keith)
+- Someone is joking with Keith, roasting him, complimenting him, or bantering with him
+- Keith's name appears with casual addresses like "hey", "yo", "bro", etc.
+- The message seems like it wants a reaction or response from Keith
+- Someone is telling Keith something about himself (e.g., "keith you're crazy", "keith your swag is unmatched")
 
 Respond NO only if:
-- Someone is explaining or describing how Keith works as a bot (e.g., "the keith bot detects...", "I programmed keith to...")
-- People are clearly talking ABOUT Keith to someone else in third person (e.g., "Keith is helpful", "thats just how keith is", "I asked keith earlier")
-- Keith is mentioned as part of a technical explanation or description
-- The message is a statement about Keith, not a message TO Keith
+- Someone is explaining technical details about how Keith works as a bot (e.g., "the keith bot uses Claude API", "I programmed keith to detect...")
+- Someone is describing Keith's capabilities or features to another person (e.g., "keith can answer questions", "the bot has a purge command")
+- Keith is mentioned purely as a reference in conversation with others, not directed at him
 
-Key insight: If the message contains a QUESTION and mentions Keith, the person almost certainly wants Keith to answer. When in doubt with questions, say YES.
+Key insight: If someone uses "you" or "your" when mentioning Keith, they're talking TO him, not ABOUT him. When in doubt, say YES.
 
 Reply with only YES or NO."""
 
@@ -521,10 +521,10 @@ class KeithBot(discord.Client):
                 limit=Config.RECENT_CHANNEL_MESSAGES + 1,
                 before=trigger_message
             ):
+                # Skip Keith's own messages and empty messages
                 if msg.author == self.user or not msg.content.strip():
                     continue
-                if msg.content.lower().strip().startswith("keith"):
-                    continue
+                # Include all user messages (even ones mentioning Keith that he didn't respond to)
                 recent.append({
                     "author": msg.author.display_name,
                     "content": msg.content[:500]

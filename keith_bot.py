@@ -8,8 +8,10 @@ Features:
 """
 
 import asyncio
+import ctypes
 import logging
 import os
+import platform
 import queue
 import threading
 from collections import defaultdict
@@ -20,6 +22,26 @@ import anthropic
 import customtkinter as ctk
 import discord
 from dotenv import load_dotenv
+
+# =============================================================================
+# High-DPI Awareness (Windows)
+# =============================================================================
+
+def enable_high_dpi():
+    """Enable high-DPI awareness for crisp rendering on Windows."""
+    if platform.system() == "Windows":
+        try:
+            # Windows 10 1607+ (Anniversary Update)
+            ctypes.windll.shcore.SetProcessDpiAwareness(2)  # PROCESS_PER_MONITOR_DPI_AWARE
+        except Exception:
+            try:
+                # Fallback for older Windows versions
+                ctypes.windll.user32.SetProcessDPIAware()
+            except Exception:
+                pass
+
+# Enable DPI awareness before creating any windows
+enable_high_dpi()
 
 # =============================================================================
 # Configuration
@@ -848,25 +870,86 @@ class KeithBot(discord.Client):
 # GUI Application
 # =============================================================================
 
+class Theme:
+    """Custom color theme for the GUI (Tokyo Night inspired)."""
+    
+    # Base colors
+    BG_DARK = "#1a1b26"          # Main background
+    BG_SURFACE = "#24283b"       # Card/panel background
+    BG_HIGHLIGHT = "#2f3549"     # Highlighted/hover background
+    BG_SIDEBAR = "#16161e"       # Sidebar background
+    
+    # Accent colors
+    PRIMARY = "#7aa2f7"          # Primary blue
+    PRIMARY_HOVER = "#5d8bef"    # Primary hover
+    SUCCESS = "#9ece6a"          # Green
+    WARNING = "#e0af68"          # Amber/yellow
+    ERROR = "#f7768e"            # Red/coral
+    PURPLE = "#bb9af7"           # Purple accent
+    CYAN = "#7dcfff"             # Cyan accent
+    
+    # Text colors
+    TEXT_PRIMARY = "#c0caf5"     # Main text
+    TEXT_SECONDARY = "#565f89"   # Muted text
+    TEXT_DIM = "#414868"         # Very muted
+    
+    # Border/divider
+    BORDER = "#3b4261"
+    DIVIDER = "#292e42"
+    
+    # Status colors
+    STATUS_CONNECTED = "#9ece6a"
+    STATUS_CONNECTING = "#e0af68"
+    STATUS_DISCONNECTED = "#565f89"
+    STATUS_ERROR = "#f7768e"
+    
+    # Specific button colors
+    BTN_TOMATO = "#db4b4b"
+    BTN_TOMATO_HOVER = "#c53b3b"
+    BTN_SUPER = "#9d7cd8"
+    BTN_SUPER_HOVER = "#8a6bc5"
+
+
 class KeithGUI(ctk.CTk):
-    """Main GUI application for Keith bot."""
+    """Main GUI application for Keith bot with modern redesigned interface."""
+    
+    # Unicode icons for sidebar and buttons
+    ICONS = {
+        "home": "\u2302",       # House
+        "memes": "\u26A1",      # Lightning bolt
+        "settings": "\u2699",   # Gear
+        "connect": "\u25B6",    # Play triangle
+        "disconnect": "\u25A0", # Stop square
+        "send": "\u27A4",       # Arrow
+        "clear": "\u2715",      # X mark
+        "tomato": "\u2764",     # Heart (tomato substitute)
+        "speaker": "\u266B",    # Music note
+        "brain": "\u2605",      # Star (brain substitute)
+    }
     
     def __init__(self):
         super().__init__()
         
         # Window setup
         self.title("Keith Bot")
-        self.geometry("900x700")
-        self.minsize(700, 500)
+        self.geometry("1000x700")
+        self.minsize(800, 550)
         
-        # Theme
+        # Apply custom theme colors
         ctk.set_appearance_mode("dark")
-        ctk.set_default_color_theme("blue")
+        self.configure(fg_color=Theme.BG_DARK)
+        
+        # Improve rendering quality
+        ctk.set_widget_scaling(1.0)  # Consistent widget scaling
+        ctk.set_window_scaling(1.0)  # Consistent window scaling
         
         # Bot reference (set later)
         self.bot: KeithBot | None = None
         self.bot_thread: threading.Thread | None = None
         self.channels: list[tuple[int, str, str]] = []
+        
+        # Current view tracking
+        self.current_view = "main"
         
         # Build UI
         self._create_widgets()
@@ -875,335 +958,740 @@ class KeithGUI(ctk.CTk):
         self.protocol("WM_DELETE_WINDOW", self._on_close)
     
     def _create_widgets(self) -> None:
-        """Create all GUI widgets."""
+        """Create all GUI widgets with modern redesigned layout."""
         
-        # Configure grid
-        self.grid_columnconfigure(0, weight=1)
-        self.grid_rowconfigure(1, weight=1)
+        # Use pack for main layout to better control sidebar width
+        # === Sidebar ===
+        self._create_sidebar()
         
-        # === Status Bar (Top) ===
-        self.status_frame = ctk.CTkFrame(self, height=50)
-        self.status_frame.grid(row=0, column=0, sticky="ew", padx=10, pady=(10, 5))
-        self.status_frame.grid_columnconfigure(1, weight=1)
+        # === Main Container (Header + Content + Input) ===
+        self.main_container = ctk.CTkFrame(self, fg_color=Theme.BG_DARK, corner_radius=0)
+        self.main_container.pack(side="left", fill="both", expand=True)
+        self.main_container.grid_columnconfigure(0, weight=1)
+        self.main_container.grid_rowconfigure(1, weight=1)  # Content area expands
+        
+        # === Header Bar ===
+        self._create_header()
+        
+        # === View Container (switchable views) ===
+        self.view_container = ctk.CTkFrame(self.main_container, fg_color="transparent")
+        self.view_container.grid(row=1, column=0, sticky="nsew", padx=15, pady=(10, 5))
+        self.view_container.grid_columnconfigure(0, weight=1)
+        self.view_container.grid_rowconfigure(0, weight=1)
+        
+        # Create all views (only one visible at a time)
+        self._create_main_view()
+        self._create_memes_view()
+        self._create_settings_view()
+        
+        # === Bottom Input Section ===
+        self._create_input_section()
+        
+        # Show default view
+        self._switch_view("main")
+    
+    def _create_sidebar(self) -> None:
+        """Create the icon sidebar for navigation."""
+        self.sidebar = ctk.CTkFrame(
+            self, 
+            width=60,
+            fg_color=Theme.BG_SIDEBAR,
+            corner_radius=0
+        )
+        self.sidebar.pack(side="left", fill="y")
+        self.sidebar.pack_propagate(False)  # IMPORTANT: Prevent children from expanding the frame
+        
+        # App logo/title at top
+        self.logo_frame = ctk.CTkFrame(self.sidebar, fg_color="transparent")
+        self.logo_frame.pack(pady=(15, 20))
+        
+        self.logo_label = ctk.CTkLabel(
+            self.logo_frame,
+            text="K",
+            font=("Arial", 20, "bold"),
+            text_color=Theme.PRIMARY
+        )
+        self.logo_label.pack()
+        
+        # Navigation buttons
+        self.nav_buttons = {}
+        
+        # Main/Dashboard button
+        self.nav_buttons["main"] = self._create_nav_button(
+            self.sidebar, 
+            self.ICONS["home"], 
+            "Dashboard",
+            lambda: self._switch_view("main"),
+            is_active=True
+        )
+        
+        # Memes button
+        self.nav_buttons["memes"] = self._create_nav_button(
+            self.sidebar, 
+            self.ICONS["memes"], 
+            "Memes",
+            lambda: self._switch_view("memes")
+        )
+        
+        # Settings button
+        self.nav_buttons["settings"] = self._create_nav_button(
+            self.sidebar, 
+            self.ICONS["settings"], 
+            "Settings",
+            lambda: self._switch_view("settings")
+        )
+        
+        # Spacer to push version to bottom
+        self.sidebar_spacer = ctk.CTkFrame(self.sidebar, fg_color="transparent")
+        self.sidebar_spacer.pack(expand=True, fill="y")
+        
+        # Version/info at bottom
+        self.version_label = ctk.CTkLabel(
+            self.sidebar,
+            text="v2.0",
+            font=("Arial", 9),
+            text_color=Theme.TEXT_DIM
+        )
+        self.version_label.pack(pady=(0, 12))
+    
+    def _create_nav_button(self, parent, icon: str, tooltip: str, command, is_active: bool = False) -> ctk.CTkButton:
+        """Create a navigation button for the sidebar."""
+        btn = ctk.CTkButton(
+            parent,
+            text=icon,
+            width=36,
+            height=36,
+            font=("Segoe UI Emoji", 16),
+            fg_color=Theme.BG_HIGHLIGHT if is_active else "transparent",
+            hover_color=Theme.BG_HIGHLIGHT,
+            text_color=Theme.PRIMARY if is_active else Theme.TEXT_PRIMARY,
+            corner_radius=8,
+            command=command
+        )
+        btn.pack(pady=4)
+        return btn
+    
+    def _create_header(self) -> None:
+        """Create the top header bar with status and connect button."""
+        self.header = ctk.CTkFrame(
+            self.main_container, 
+            height=60, 
+            fg_color=Theme.BG_SURFACE,
+            corner_radius=0
+        )
+        self.header.grid(row=0, column=0, sticky="ew")
+        self.header.grid_columnconfigure(1, weight=1)
+        self.header.grid_propagate(False)
+        
+        # App title
+        self.title_frame = ctk.CTkFrame(self.header, fg_color="transparent")
+        self.title_frame.grid(row=0, column=0, sticky="w", padx=20, pady=10)
+        
+        self.app_title = ctk.CTkLabel(
+            self.title_frame,
+            text="KEITH BOT",
+            font=("Arial", 18, "bold"),
+            text_color=Theme.TEXT_PRIMARY
+        )
+        self.app_title.pack(side="left")
+        
+        self.app_subtitle = ctk.CTkLabel(
+            self.title_frame,
+            text="  Discord AI Assistant",
+            font=("Arial", 12),
+            text_color=Theme.TEXT_SECONDARY
+        )
+        self.app_subtitle.pack(side="left", padx=(5, 0))
+        
+        # Status section (center-right)
+        self.status_frame = ctk.CTkFrame(self.header, fg_color="transparent")
+        self.status_frame.grid(row=0, column=1, sticky="e", padx=10, pady=10)
         
         self.status_indicator = ctk.CTkLabel(
-            self.status_frame, 
-            text="●", 
-            font=("Arial", 20),
-            text_color="gray"
+            self.status_frame,
+            text="\u25CF",  # Filled circle
+            font=("Arial", 16),
+            text_color=Theme.STATUS_DISCONNECTED
         )
-        self.status_indicator.grid(row=0, column=0, padx=(15, 5), pady=10)
+        self.status_indicator.pack(side="left", padx=(0, 8))
         
         self.status_label = ctk.CTkLabel(
-            self.status_frame, 
-            text="Disconnected", 
-            font=("Arial", 14)
+            self.status_frame,
+            text="Disconnected",
+            font=("Arial", 13),
+            text_color=Theme.TEXT_SECONDARY
         )
-        self.status_label.grid(row=0, column=1, sticky="w", pady=10)
+        self.status_label.pack(side="left")
         
+        # Connect button
         self.connect_btn = ctk.CTkButton(
-            self.status_frame, 
-            text="Connect", 
+            self.header,
+            text=f"{self.ICONS['connect']} Connect",
             command=self._toggle_connection,
-            width=100
+            width=120,
+            height=36,
+            font=("Arial", 13, "bold"),
+            fg_color=Theme.PRIMARY,
+            hover_color=Theme.PRIMARY_HOVER,
+            corner_radius=8
         )
-        self.connect_btn.grid(row=0, column=2, padx=(15, 10), pady=10)
-        
-        # Smart detection toggle
-        self.smart_detection_var = ctk.BooleanVar(value=False)
-        self.smart_detection_toggle = ctk.CTkSwitch(
-            self.status_frame,
-            text="Smart Detection",
-            variable=self.smart_detection_var,
-            command=self._toggle_smart_detection,
-            onvalue=True,
-            offvalue=False
-        )
-        self.smart_detection_toggle.grid(row=0, column=3, padx=(10, 10), pady=10)
-        
-        # Command prefix
-        self.prefix_label = ctk.CTkLabel(
-            self.status_frame,
-            text="Prefix:",
-            font=("Arial", 12)
-        )
-        self.prefix_label.grid(row=0, column=4, padx=(10, 5), pady=10)
-        
-        self.prefix_entry = ctk.CTkEntry(
-            self.status_frame,
-            width=50,
-            justify="center"
-        )
-        self.prefix_entry.insert(0, "k!")
-        self.prefix_entry.grid(row=0, column=5, padx=(0, 15), pady=10)
-        
-        # === Main Content Area (Two Panels Side by Side) ===
-        self.content_frame = ctk.CTkFrame(self, fg_color="transparent")
-        self.content_frame.grid(row=1, column=0, sticky="nsew", padx=10, pady=5)
-        self.content_frame.grid_columnconfigure(0, weight=1)
-        self.content_frame.grid_columnconfigure(1, weight=1)
-        self.content_frame.grid_rowconfigure(0, weight=1)
+        self.connect_btn.grid(row=0, column=2, padx=(10, 20), pady=10)
+    
+    def _create_main_view(self) -> None:
+        """Create the main dashboard view with Console and Memory panels."""
+        self.main_view = ctk.CTkFrame(self.view_container, fg_color="transparent")
+        self.main_view.grid_columnconfigure(0, weight=1)
+        self.main_view.grid_columnconfigure(1, weight=1)
+        self.main_view.grid_rowconfigure(0, weight=1)
         
         # === Left Panel: Console Logs ===
-        self.console_frame = ctk.CTkFrame(self.content_frame)
-        self.console_frame.grid(row=0, column=0, sticky="nsew", padx=(0, 5), pady=0)
+        self.console_frame = ctk.CTkFrame(
+            self.main_view, 
+            fg_color=Theme.BG_SURFACE,
+            corner_radius=12,
+            border_width=1,
+            border_color=Theme.BORDER
+        )
+        self.console_frame.grid(row=0, column=0, sticky="nsew", padx=(0, 8), pady=0)
         self.console_frame.grid_columnconfigure(0, weight=1)
         self.console_frame.grid_rowconfigure(1, weight=1)
         
-        # Console header with label and clear button
+        # Console header
         self.console_header = ctk.CTkFrame(self.console_frame, fg_color="transparent")
-        self.console_header.grid(row=0, column=0, sticky="ew", padx=10, pady=(10, 0))
+        self.console_header.grid(row=0, column=0, sticky="ew", padx=15, pady=(15, 5))
         self.console_header.grid_columnconfigure(0, weight=1)
         
-        self.console_label = ctk.CTkLabel(
-            self.console_header, 
-            text="Console Logs", 
-            font=("Arial", 12, "bold"),
-            anchor="w"
+        self.console_title_frame = ctk.CTkFrame(self.console_header, fg_color="transparent")
+        self.console_title_frame.grid(row=0, column=0, sticky="w")
+        
+        self.console_icon = ctk.CTkLabel(
+            self.console_title_frame,
+            text="\u2630",  # Trigram/menu icon
+            font=("Segoe UI Emoji", 14),
+            text_color=Theme.CYAN
         )
-        self.console_label.grid(row=0, column=0, sticky="w")
+        self.console_icon.pack(side="left", padx=(0, 8))
+        
+        self.console_label = ctk.CTkLabel(
+            self.console_title_frame,
+            text="Console Logs",
+            font=("Arial", 14, "bold"),
+            text_color=Theme.TEXT_PRIMARY
+        )
+        self.console_label.pack(side="left")
         
         self.clear_logs_btn = ctk.CTkButton(
             self.console_header,
-            text="Clear Logs",
+            text=f"{self.ICONS['clear']} Clear",
             command=self._clear_console_logs,
-            width=80,
-            height=24,
+            width=75,
+            height=28,
             font=("Arial", 11),
             fg_color="transparent",
-            border_width=1
+            hover_color=Theme.BG_HIGHLIGHT,
+            text_color=Theme.TEXT_PRIMARY,  # Brighter text
+            border_width=1,
+            border_color=Theme.BORDER,
+            corner_radius=6
         )
         self.clear_logs_btn.grid(row=0, column=1, sticky="e")
         
         # Console log textbox
         self.console_log = ctk.CTkTextbox(
-            self.console_frame, 
+            self.console_frame,
             font=("Consolas", 11),
             state="disabled",
-            wrap="word"
+            wrap="word",
+            fg_color=Theme.BG_DARK,
+            text_color=Theme.TEXT_PRIMARY,
+            corner_radius=8
         )
-        self.console_log.grid(row=1, column=0, sticky="nsew", padx=10, pady=(5, 10))
+        self.console_log.grid(row=1, column=0, sticky="nsew", padx=15, pady=(5, 15))
         
         # Console text tags
-        self.console_log._textbox.tag_config("info", foreground="#8b949e")
-        self.console_log._textbox.tag_config("success", foreground="#7ee787")
-        self.console_log._textbox.tag_config("warning", foreground="#d29922")
-        self.console_log._textbox.tag_config("error", foreground="#f85149")
-        self.console_log._textbox.tag_config("timestamp", foreground="#6e7681")
+        self.console_log._textbox.tag_config("info", foreground=Theme.TEXT_SECONDARY)
+        self.console_log._textbox.tag_config("success", foreground=Theme.SUCCESS)
+        self.console_log._textbox.tag_config("warning", foreground=Theme.WARNING)
+        self.console_log._textbox.tag_config("error", foreground=Theme.ERROR)
+        self.console_log._textbox.tag_config("timestamp", foreground=Theme.TEXT_DIM)
         
         # === Right Panel: Memory (AI Conversations) ===
-        self.memory_frame = ctk.CTkFrame(self.content_frame)
-        self.memory_frame.grid(row=0, column=1, sticky="nsew", padx=(5, 0), pady=0)
+        self.memory_frame = ctk.CTkFrame(
+            self.main_view, 
+            fg_color=Theme.BG_SURFACE,
+            corner_radius=12,
+            border_width=1,
+            border_color=Theme.BORDER
+        )
+        self.memory_frame.grid(row=0, column=1, sticky="nsew", padx=(8, 0), pady=0)
         self.memory_frame.grid_columnconfigure(0, weight=1)
         self.memory_frame.grid_rowconfigure(1, weight=1)
         
-        # Memory header with label and erase button
+        # Memory header
         self.memory_header = ctk.CTkFrame(self.memory_frame, fg_color="transparent")
-        self.memory_header.grid(row=0, column=0, sticky="ew", padx=10, pady=(10, 0))
+        self.memory_header.grid(row=0, column=0, sticky="ew", padx=15, pady=(15, 5))
         self.memory_header.grid_columnconfigure(0, weight=1)
         
-        self.memory_label = ctk.CTkLabel(
-            self.memory_header, 
-            text="Memory (AI Context)", 
-            font=("Arial", 12, "bold"),
-            anchor="w"
+        self.memory_title_frame = ctk.CTkFrame(self.memory_header, fg_color="transparent")
+        self.memory_title_frame.grid(row=0, column=0, sticky="w")
+        
+        self.memory_icon = ctk.CTkLabel(
+            self.memory_title_frame,
+            text=self.ICONS["brain"],
+            font=("Segoe UI Emoji", 14),
+            text_color=Theme.PURPLE
         )
-        self.memory_label.grid(row=0, column=0, sticky="w")
+        self.memory_icon.pack(side="left", padx=(0, 8))
+        
+        self.memory_label = ctk.CTkLabel(
+            self.memory_title_frame,
+            text="Memory",
+            font=("Arial", 14, "bold"),
+            text_color=Theme.TEXT_PRIMARY
+        )
+        self.memory_label.pack(side="left")
         
         self.erase_memory_btn = ctk.CTkButton(
             self.memory_header,
-            text="Erase Memory",
+            text=f"{self.ICONS['clear']} Erase",
             command=self._erase_memory,
-            width=100,
-            height=24,
+            width=80,
+            height=28,
             font=("Arial", 11),
-            fg_color="#7c3aed",
-            hover_color="#6d28d9"
+            fg_color=Theme.PURPLE,
+            hover_color=Theme.BTN_SUPER_HOVER,
+            corner_radius=6
         )
         self.erase_memory_btn.grid(row=0, column=1, sticky="e")
         
         # Memory log textbox
         self.memory_log = ctk.CTkTextbox(
-            self.memory_frame, 
+            self.memory_frame,
             font=("Consolas", 11),
             state="disabled",
-            wrap="word"
+            wrap="word",
+            fg_color=Theme.BG_DARK,
+            text_color=Theme.TEXT_PRIMARY,
+            corner_radius=8
         )
-        self.memory_log.grid(row=1, column=0, sticky="nsew", padx=10, pady=(5, 10))
+        self.memory_log.grid(row=1, column=0, sticky="nsew", padx=15, pady=(5, 15))
         
-        # Memory text tags (for conversations)
-        self.memory_log._textbox.tag_config("user", foreground="#58a6ff")          # Blue for user asking Keith
-        self.memory_log._textbox.tag_config("keith", foreground="#7ee787")         # Green for Keith's response
-        self.memory_log._textbox.tag_config("manual", foreground="#d29922")        # Yellow for manual messages
-        self.memory_log._textbox.tag_config("channel", foreground="#a371f7")       # Purple for channel name
-        self.memory_log._textbox.tag_config("divider", foreground="#484f58")       # Dim for dividers
-        self.memory_log._textbox.tag_config("context_author", foreground="#8b949e")  # Gray for context authors
-        self.memory_log._textbox.tag_config("context_msg", foreground="#6e7681")     # Dimmer gray for context text
+        # Memory text tags
+        self.memory_log._textbox.tag_config("user", foreground=Theme.PRIMARY)
+        self.memory_log._textbox.tag_config("keith", foreground=Theme.SUCCESS)
+        self.memory_log._textbox.tag_config("manual", foreground=Theme.WARNING)
+        self.memory_log._textbox.tag_config("channel", foreground=Theme.PURPLE)
+        self.memory_log._textbox.tag_config("divider", foreground=Theme.TEXT_DIM)
+        self.memory_log._textbox.tag_config("context_author", foreground=Theme.TEXT_SECONDARY)
+        self.memory_log._textbox.tag_config("context_msg", foreground=Theme.TEXT_DIM)
+        self.memory_log._textbox.tag_config("timestamp", foreground=Theme.TEXT_DIM)
+    
+    def _create_memes_view(self) -> None:
+        """Create the memes view with Tomato Town and Super Server controls."""
+        self.memes_view = ctk.CTkFrame(self.view_container, fg_color="transparent")
+        self.memes_view.grid_columnconfigure(0, weight=1)
         
-        # === Memes Section ===
-        self.memes_frame = ctk.CTkFrame(self)
-        self.memes_frame.grid(row=2, column=0, sticky="ew", padx=10, pady=5)
-        self.memes_frame.grid_columnconfigure(5, weight=1)
-        
-        # Memes section label
-        self.memes_label = ctk.CTkLabel(
-            self.memes_frame,
-            text="Memes:",
-            font=("Arial", 12, "bold")
+        # Title
+        self.memes_title = ctk.CTkLabel(
+            self.memes_view,
+            text=f"{self.ICONS['memes']} Meme Controls",
+            font=("Arial", 20, "bold"),
+            text_color=Theme.TEXT_PRIMARY
         )
-        self.memes_label.grid(row=0, column=0, padx=(15, 10), pady=12)
+        self.memes_title.grid(row=0, column=0, sticky="w", pady=(0, 20))
         
-        # Tomato Town button
-        self.tomato_btn = ctk.CTkButton(
-            self.memes_frame,
+        # === Tomato Town Card ===
+        self.tomato_card = ctk.CTkFrame(
+            self.memes_view,
+            fg_color=Theme.BG_SURFACE,
+            corner_radius=12,
+            border_width=1,
+            border_color=Theme.BORDER
+        )
+        self.tomato_card.grid(row=1, column=0, sticky="ew", pady=(0, 15))
+        self.tomato_card.grid_columnconfigure(1, weight=1)
+        
+        # Tomato icon
+        self.tomato_icon_label = ctk.CTkLabel(
+            self.tomato_card,
+            text=self.ICONS["tomato"],
+            font=("Segoe UI Emoji", 36)
+        )
+        self.tomato_icon_label.grid(row=0, column=0, rowspan=2, padx=20, pady=20)
+        
+        # Tomato title and description
+        self.tomato_title = ctk.CTkLabel(
+            self.tomato_card,
             text="Tomato Town",
+            font=("Arial", 16, "bold"),
+            text_color=Theme.TEXT_PRIMARY
+        )
+        self.tomato_title.grid(row=0, column=1, sticky="w", padx=(0, 20), pady=(20, 5))
+        
+        self.tomato_desc = ctk.CTkLabel(
+            self.tomato_card,
+            text="Gather everyone to a voice channel, play audio, then kick them all!",
+            font=("Arial", 12),
+            text_color=Theme.TEXT_SECONDARY
+        )
+        self.tomato_desc.grid(row=1, column=1, sticky="w", padx=(0, 20), pady=(0, 5))
+        
+        # Tomato controls
+        self.tomato_controls = ctk.CTkFrame(self.tomato_card, fg_color="transparent")
+        self.tomato_controls.grid(row=2, column=0, columnspan=3, sticky="ew", padx=20, pady=(10, 20))
+        
+        self.tomato_btn = ctk.CTkButton(
+            self.tomato_controls,
+            text=f"{self.ICONS['tomato']} Execute Tomato Town",
             command=self._tomato_town,
-            width=120,
-            height=36,
-            fg_color="#dc2626",
-            hover_color="#b91c1c",
+            width=180,
+            height=40,
             font=("Arial", 13, "bold"),
+            fg_color=Theme.BTN_TOMATO,
+            hover_color=Theme.BTN_TOMATO_HOVER,
+            corner_radius=8,
             state="disabled"
         )
-        self.tomato_btn.grid(row=0, column=1, padx=(0, 10), pady=12)
+        self.tomato_btn.pack(side="left", padx=(0, 15))
         
-        # Toggle for sending message
         self.tomato_msg_var = ctk.BooleanVar(value=False)
         self.tomato_msg_toggle = ctk.CTkSwitch(
-            self.memes_frame,
+            self.tomato_controls,
             text="Send message",
             variable=self.tomato_msg_var,
             command=self._toggle_tomato_message,
             onvalue=True,
-            offvalue=False
+            offvalue=False,
+            progress_color=Theme.PRIMARY
         )
-        self.tomato_msg_toggle.grid(row=0, column=2, padx=(10, 10), pady=12)
+        self.tomato_msg_toggle.pack(side="left", padx=(0, 10))
         
-        # Message entry (hidden by default)
         self.tomato_msg_entry = ctk.CTkEntry(
-            self.memes_frame,
+            self.tomato_controls,
             placeholder_text="Message to send...",
-            width=200
+            width=200,
+            fg_color=Theme.BG_DARK,
+            border_color=Theme.BORDER
         )
         self.tomato_msg_entry.insert(0, "Tomato Town Massacre")
-        # Don't grid yet - will be shown when toggle is on
+        # Hidden by default
         
-        # Separator
-        self.memes_separator = ctk.CTkLabel(
-            self.memes_frame,
-            text="|",
-            font=("Arial", 16),
-            text_color="#484f58"
+        # === Super Server Card ===
+        self.super_card = ctk.CTkFrame(
+            self.memes_view,
+            fg_color=Theme.BG_SURFACE,
+            corner_radius=12,
+            border_width=1,
+            border_color=Theme.BORDER
         )
-        self.memes_separator.grid(row=0, column=4, padx=(15, 15), pady=12)
+        self.super_card.grid(row=2, column=0, sticky="ew", pady=(0, 15))
+        self.super_card.grid_columnconfigure(1, weight=1)
         
-        # Super Server toggle button
+        # Super Server icon
+        self.super_icon_label = ctk.CTkLabel(
+            self.super_card,
+            text=self.ICONS["speaker"],
+            font=("Segoe UI Emoji", 36)
+        )
+        self.super_icon_label.grid(row=0, column=0, rowspan=2, padx=20, pady=20)
+        
+        # Super Server title and description
+        self.super_title = ctk.CTkLabel(
+            self.super_card,
+            text="Super Server",
+            font=("Arial", 16, "bold"),
+            text_color=Theme.TEXT_PRIMARY
+        )
+        self.super_title.grid(row=0, column=1, sticky="w", padx=(0, 20), pady=(20, 5))
+        
+        self.super_desc = ctk.CTkLabel(
+            self.super_card,
+            text="Join a voice channel and loop audio indefinitely.",
+            font=("Arial", 12),
+            text_color=Theme.TEXT_SECONDARY
+        )
+        self.super_desc.grid(row=1, column=1, sticky="w", padx=(0, 20), pady=(0, 20))
+        
+        # Super Server button
         self.super_server_active = False
         self.super_server_btn = ctk.CTkButton(
-            self.memes_frame,
-            text="Super Server",
+            self.super_card,
+            text=f"{self.ICONS['speaker']} Start Super Server",
             command=self._toggle_super_server,
-            width=120,
-            height=36,
-            fg_color="#7c3aed",
-            hover_color="#6d28d9",
+            width=180,
+            height=40,
             font=("Arial", 13, "bold"),
+            fg_color=Theme.BTN_SUPER,
+            hover_color=Theme.BTN_SUPER_HOVER,
+            corner_radius=8,
             state="disabled"
         )
-        self.super_server_btn.grid(row=0, column=5, padx=(0, 15), pady=12)
+        self.super_server_btn.grid(row=2, column=0, columnspan=2, sticky="w", padx=20, pady=(0, 20))
+    
+    def _create_settings_view(self) -> None:
+        """Create the settings view with configuration options."""
+        self.settings_view = ctk.CTkFrame(self.view_container, fg_color="transparent")
+        self.settings_view.grid_columnconfigure(0, weight=1)
         
-        # === Spam Ping Section ===
-        self.spam_ping_frame = ctk.CTkFrame(self)
-        self.spam_ping_frame.grid(row=3, column=0, sticky="ew", padx=10, pady=5)
-        
-        self.spam_ping_label = ctk.CTkLabel(
-            self.spam_ping_frame,
-            text="Spam Ping:",
-            font=("Arial", 12)
+        # Title
+        self.settings_title = ctk.CTkLabel(
+            self.settings_view,
+            text=f"{self.ICONS['settings']} Settings",
+            font=("Arial", 20, "bold"),
+            text_color=Theme.TEXT_PRIMARY
         )
-        self.spam_ping_label.grid(row=0, column=0, padx=(15, 10), pady=12)
+        self.settings_title.grid(row=0, column=0, sticky="w", pady=(0, 20))
         
-        self.spam_ping_info = ctk.CTkLabel(
-            self.spam_ping_frame,
-            text="Use 'ping @user' in Discord",
-            font=("Arial", 11),
-            text_color="#8b949e"
+        # === Bot Settings Card ===
+        self.bot_settings_card = ctk.CTkFrame(
+            self.settings_view,
+            fg_color=Theme.BG_SURFACE,
+            corner_radius=12,
+            border_width=1,
+            border_color=Theme.BORDER
         )
-        self.spam_ping_info.grid(row=0, column=1, padx=(0, 15), pady=12)
+        self.bot_settings_card.grid(row=1, column=0, sticky="ew", pady=(0, 15))
+        self.bot_settings_card.grid_columnconfigure(1, weight=1)
         
-        self.spam_ping_count_label = ctk.CTkLabel(
-            self.spam_ping_frame,
-            text="Count:",
-            font=("Arial", 12)
+        self.bot_settings_title = ctk.CTkLabel(
+            self.bot_settings_card,
+            text="Bot Configuration",
+            font=("Arial", 14, "bold"),
+            text_color=Theme.TEXT_PRIMARY
         )
-        self.spam_ping_count_label.grid(row=0, column=2, padx=(15, 5), pady=12)
+        self.bot_settings_title.grid(row=0, column=0, columnspan=2, sticky="w", padx=20, pady=(20, 15))
+        
+        # Command Prefix
+        self.prefix_label = ctk.CTkLabel(
+            self.bot_settings_card,
+            text="Command Prefix:",
+            font=("Arial", 13),
+            text_color=Theme.TEXT_PRIMARY
+        )
+        self.prefix_label.grid(row=1, column=0, sticky="w", padx=20, pady=(0, 10))
+        
+        self.prefix_entry = ctk.CTkEntry(
+            self.bot_settings_card,
+            width=80,
+            justify="center",
+            fg_color=Theme.BG_DARK,
+            border_color=Theme.BORDER,
+            corner_radius=6
+        )
+        self.prefix_entry.insert(0, "k!")
+        self.prefix_entry.grid(row=1, column=1, sticky="w", padx=20, pady=(0, 10))
+        
+        # Smart Detection Toggle
+        self.smart_label = ctk.CTkLabel(
+            self.bot_settings_card,
+            text="Smart Detection:",
+            font=("Arial", 13),
+            text_color=Theme.TEXT_PRIMARY
+        )
+        self.smart_label.grid(row=2, column=0, sticky="w", padx=20, pady=(0, 10))
+        
+        self.smart_detection_var = ctk.BooleanVar(value=False)
+        self.smart_detection_toggle = ctk.CTkSwitch(
+            self.bot_settings_card,
+            text="Respond to relevant mentions",
+            variable=self.smart_detection_var,
+            command=self._toggle_smart_detection,
+            onvalue=True,
+            offvalue=False,
+            progress_color=Theme.PRIMARY
+        )
+        self.smart_detection_toggle.grid(row=2, column=1, sticky="w", padx=20, pady=(0, 10))
+        
+        # Spam Ping Count
+        self.ping_label = ctk.CTkLabel(
+            self.bot_settings_card,
+            text="Spam Ping Count:",
+            font=("Arial", 13),
+            text_color=Theme.TEXT_PRIMARY
+        )
+        self.ping_label.grid(row=3, column=0, sticky="w", padx=20, pady=(0, 20))
+        
+        self.ping_frame = ctk.CTkFrame(self.bot_settings_card, fg_color="transparent")
+        self.ping_frame.grid(row=3, column=1, sticky="w", padx=20, pady=(0, 20))
         
         self.spam_ping_count_entry = ctk.CTkEntry(
-            self.spam_ping_frame,
+            self.ping_frame,
             width=60,
-            justify="center"
+            justify="center",
+            fg_color=Theme.BG_DARK,
+            border_color=Theme.BORDER,
+            corner_radius=6
         )
         self.spam_ping_count_entry.insert(0, "5")
-        self.spam_ping_count_entry.grid(row=0, column=3, padx=(0, 15), pady=12)
+        self.spam_ping_count_entry.pack(side="left")
         
-        # === Manual Message Section (Bottom) ===
-        self.input_frame = ctk.CTkFrame(self)
-        self.input_frame.grid(row=4, column=0, sticky="ew", padx=10, pady=(5, 10))
-        self.input_frame.grid_columnconfigure(1, weight=1)
+        self.ping_info = ctk.CTkLabel(
+            self.ping_frame,
+            text="(Use 'ping @user' in Discord)",
+            font=("Arial", 11),
+            text_color=Theme.TEXT_DIM
+        )
+        self.ping_info.pack(side="left", padx=(10, 0))
         
-        # Channel selector
-        self.channel_label = ctk.CTkLabel(self.input_frame, text="Channel:")
-        self.channel_label.grid(row=0, column=0, padx=(15, 5), pady=10)
+        # === About Card ===
+        self.about_card = ctk.CTkFrame(
+            self.settings_view,
+            fg_color=Theme.BG_SURFACE,
+            corner_radius=12,
+            border_width=1,
+            border_color=Theme.BORDER
+        )
+        self.about_card.grid(row=2, column=0, sticky="ew", pady=(0, 15))
+        
+        self.about_title = ctk.CTkLabel(
+            self.about_card,
+            text="About Keith Bot",
+            font=("Arial", 14, "bold"),
+            text_color=Theme.TEXT_PRIMARY
+        )
+        self.about_title.grid(row=0, column=0, sticky="w", padx=20, pady=(20, 10))
+        
+        self.about_text = ctk.CTkLabel(
+            self.about_card,
+            text="Keith is an AI-powered Discord bot using Anthropic's Claude API.\n"
+                 "Features include AI chat with memory, voice channel controls, and fun meme commands.",
+            font=("Arial", 12),
+            text_color=Theme.TEXT_SECONDARY,
+            justify="left"
+        )
+        self.about_text.grid(row=1, column=0, sticky="w", padx=20, pady=(0, 20))
+    
+    def _create_input_section(self) -> None:
+        """Create the bottom input section for manual messages."""
+        self.input_frame = ctk.CTkFrame(
+            self.main_container,
+            fg_color=Theme.BG_SURFACE,
+            corner_radius=12,
+            border_width=1,
+            border_color=Theme.BORDER
+        )
+        self.input_frame.grid(row=2, column=0, sticky="ew", padx=15, pady=(5, 15))
+        self.input_frame.grid_columnconfigure(0, weight=1)
+        
+        # Inner container for proper padding
+        self.input_inner = ctk.CTkFrame(self.input_frame, fg_color="transparent")
+        self.input_inner.pack(fill="both", expand=True, padx=15, pady=12)
+        self.input_inner.grid_columnconfigure(1, weight=1)
+        
+        # Channel selector row
+        self.channel_label = ctk.CTkLabel(
+            self.input_inner,
+            text="Channel:",
+            font=("Arial", 12),
+            text_color=Theme.TEXT_PRIMARY
+        )
+        self.channel_label.grid(row=0, column=0, sticky="w", padx=(0, 10), pady=(0, 8))
         
         self.channel_dropdown = ctk.CTkComboBox(
-            self.input_frame, 
+            self.input_inner,
             values=["Not connected..."],
-            width=250,
-            state="disabled"
+            width=260,
+            state="disabled",
+            fg_color=Theme.BG_DARK,
+            border_color=Theme.BORDER,
+            button_color=Theme.BG_HIGHLIGHT,
+            button_hover_color=Theme.BORDER,
+            dropdown_fg_color=Theme.BG_SURFACE,
+            corner_radius=6
         )
-        self.channel_dropdown.grid(row=0, column=1, sticky="w", padx=5, pady=10)
+        self.channel_dropdown.grid(row=0, column=1, sticky="w", pady=(0, 8))
         
-        # Message input
-        self.message_label = ctk.CTkLabel(self.input_frame, text="Message:")
-        self.message_label.grid(row=1, column=0, padx=(15, 5), pady=(0, 10))
+        # Message input row
+        self.message_label = ctk.CTkLabel(
+            self.input_inner,
+            text="Message:",
+            font=("Arial", 12),
+            text_color=Theme.TEXT_PRIMARY
+        )
+        self.message_label.grid(row=1, column=0, sticky="w", padx=(0, 10))
+        
+        self.message_frame = ctk.CTkFrame(self.input_inner, fg_color="transparent")
+        self.message_frame.grid(row=1, column=1, sticky="ew")
+        self.message_frame.grid_columnconfigure(0, weight=1)
         
         self.message_entry = ctk.CTkEntry(
-            self.input_frame, 
+            self.message_frame,
             placeholder_text="Type a message to send as Keith...",
-            state="disabled"
+            state="disabled",
+            fg_color=Theme.BG_DARK,
+            border_color=Theme.BORDER,
+            corner_radius=6,
+            height=36
         )
-        self.message_entry.grid(row=1, column=1, sticky="ew", padx=5, pady=(0, 10))
+        self.message_entry.grid(row=0, column=0, sticky="ew", padx=(0, 10))
         self.message_entry.bind("<Return>", lambda e: self._send_manual_message())
         
         self.send_btn = ctk.CTkButton(
-            self.input_frame, 
-            text="Send", 
+            self.message_frame,
+            text=f"{self.ICONS['send']} Send",
             command=self._send_manual_message,
-            width=80,
+            width=90,
+            height=36,
+            font=("Arial", 12, "bold"),
+            fg_color=Theme.PRIMARY,
+            hover_color=Theme.PRIMARY_HOVER,
+            corner_radius=6,
             state="disabled"
         )
-        self.send_btn.grid(row=1, column=2, padx=(5, 15), pady=(0, 10))
+        self.send_btn.grid(row=0, column=1)
+    
+    def _switch_view(self, view_name: str) -> None:
+        """Switch to a different view in the main content area."""
+        # Hide all views
+        self.main_view.grid_forget()
+        self.memes_view.grid_forget()
+        self.settings_view.grid_forget()
+        
+        # Update nav button styles
+        for name, btn in self.nav_buttons.items():
+            if name == view_name:
+                btn.configure(fg_color=Theme.BG_HIGHLIGHT, text_color=Theme.PRIMARY)
+            else:
+                btn.configure(fg_color="transparent", text_color=Theme.TEXT_PRIMARY)  # Brighter
+        
+        # Show selected view
+        if view_name == "main":
+            self.main_view.grid(row=0, column=0, sticky="nsew")
+        elif view_name == "memes":
+            self.memes_view.grid(row=0, column=0, sticky="nsew")
+        elif view_name == "settings":
+            self.settings_view.grid(row=0, column=0, sticky="nsew")
+        
+        self.current_view = view_name
     
     def set_status(self, status: str, text: str) -> None:
         """Update connection status display."""
         colors = {
-            "connected": "#7ee787",
-            "connecting": "#d29922",
-            "disconnected": "#8b949e",
-            "error": "#f85149"
+            "connected": Theme.STATUS_CONNECTED,
+            "connecting": Theme.STATUS_CONNECTING,
+            "disconnected": Theme.STATUS_DISCONNECTED,
+            "error": Theme.STATUS_ERROR
         }
-        self.status_indicator.configure(text_color=colors.get(status, "gray"))
+        self.status_indicator.configure(text_color=colors.get(status, Theme.TEXT_SECONDARY))
         self.status_label.configure(text=text)
         
         if status == "connected":
-            self.connect_btn.configure(text="Disconnect")
+            self.connect_btn.configure(
+                text=f"{self.ICONS['disconnect']} Disconnect",
+                fg_color=Theme.ERROR,
+                hover_color=Theme.BTN_TOMATO_HOVER
+            )
             self.message_entry.configure(state="normal")
             self.send_btn.configure(state="normal")
             self.channel_dropdown.configure(state="readonly")
             self.tomato_btn.configure(state="normal")
             self.super_server_btn.configure(state="normal")
         else:
-            self.connect_btn.configure(text="Connect")
+            self.connect_btn.configure(
+                text=f"{self.ICONS['connect']} Connect",
+                fg_color=Theme.PRIMARY,
+                hover_color=Theme.PRIMARY_HOVER
+            )
             self.message_entry.configure(state="disabled")
             self.send_btn.configure(state="disabled")
             self.channel_dropdown.configure(state="disabled")
@@ -1333,9 +1821,9 @@ class KeithGUI(ctk.CTk):
     def _toggle_tomato_message(self) -> None:
         """Show/hide the tomato message entry based on toggle state."""
         if self.tomato_msg_var.get():
-            self.tomato_msg_entry.grid(row=0, column=3, sticky="ew", padx=(10, 0), pady=12)
+            self.tomato_msg_entry.pack(side="left", padx=(10, 0))
         else:
-            self.tomato_msg_entry.grid_remove()
+            self.tomato_msg_entry.pack_forget()
     
     def _toggle_super_server(self) -> None:
         """Toggle Super Server mode on/off."""
@@ -1346,9 +1834,9 @@ class KeithGUI(ctk.CTk):
             # Turn ON
             self.super_server_active = True
             self.super_server_btn.configure(
-                text="Stop Server",
-                fg_color="#dc2626",
-                hover_color="#b91c1c"
+                text=f"{self.ICONS['speaker']} Stop Server",
+                fg_color=Theme.BTN_TOMATO,
+                hover_color=Theme.BTN_TOMATO_HOVER
             )
             self.log_console("Starting Super Server...", "warning")
             self.bot.queue_action("super_server_start")
@@ -1356,9 +1844,9 @@ class KeithGUI(ctk.CTk):
             # Turn OFF
             self.super_server_active = False
             self.super_server_btn.configure(
-                text="Super Server",
-                fg_color="#7c3aed",
-                hover_color="#6d28d9"
+                text=f"{self.ICONS['speaker']} Start Super Server",
+                fg_color=Theme.BTN_SUPER,
+                hover_color=Theme.BTN_SUPER_HOVER
             )
             self.log_console("Stopping Super Server...", "info")
             self.bot.queue_action("super_server_stop")
@@ -1367,9 +1855,9 @@ class KeithGUI(ctk.CTk):
         """Reset the Super Server button to OFF state (called on error or disconnect)."""
         self.super_server_active = False
         self.super_server_btn.configure(
-            text="Super Server",
-            fg_color="#7c3aed",
-            hover_color="#6d28d9"
+            text=f"{self.ICONS['speaker']} Start Super Server",
+            fg_color=Theme.BTN_SUPER,
+            hover_color=Theme.BTN_SUPER_HOVER
         )
     
     def _toggle_smart_detection(self) -> None:

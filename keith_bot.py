@@ -269,6 +269,13 @@ class KeithBot(discord.Client):
         self.smart_detection = False  # Toggle for AI-based relevance detection
         self.super_server_active = False  # Toggle for Super Server mode
         self._super_server_voice_client: discord.VoiceClient | None = None
+        
+        # Stalker Mode state
+        self.stalker_mode_active = False
+        self.stalker_target_id: int | None = None
+        self._stalker_voice_client: discord.VoiceClient | None = None
+        self._stalker_audio_start_time: float | None = None  # When current playback started
+        self._stalker_audio_offset: float = 0.0  # Offset in seconds for resume
     
     async def setup_hook(self) -> None:
         """Start background tasks."""
@@ -329,6 +336,194 @@ class KeithBot(discord.Client):
             # Classic mode: only respond if message starts with "keith"
             if content_lower.startswith("keith"):
                 await self._handle_keith(message)
+    
+    async def on_voice_state_update(
+        self, 
+        member: discord.Member, 
+        before: discord.VoiceState, 
+        after: discord.VoiceState
+    ) -> None:
+        """Handle voice state changes for Stalker Mode."""
+        if not self.stalker_mode_active or not self.stalker_target_id:
+            return
+        
+        # Only track the target user
+        if member.id != self.stalker_target_id:
+            return
+        
+        # User joined a voice channel (wasn't in one before)
+        if before.channel is None and after.channel is not None:
+            self.gui.log_console(f"[Stalker] Target {member.display_name} joined #{after.channel.name}", "warning")
+            await self._stalker_join_channel(after.channel)
+        
+        # User moved to a different voice channel
+        elif before.channel is not None and after.channel is not None and before.channel != after.channel:
+            self.gui.log_console(f"[Stalker] Target {member.display_name} moved to #{after.channel.name}", "warning")
+            await self._stalker_move_channel(after.channel)
+        
+        # User disconnected from voice
+        elif before.channel is not None and after.channel is None:
+            self.gui.log_console(f"[Stalker] Target {member.display_name} disconnected from voice", "info")
+            await self._stalker_disconnect()
+    
+    async def _stalker_join_channel(self, channel: discord.VoiceChannel) -> None:
+        """Join a voice channel and start playing audio for Stalker Mode."""
+        try:
+            self._stalker_voice_client = await channel.connect()
+            self.gui.log_console(f"[Stalker] Keith joined #{channel.name}", "success")
+            self._stalker_audio_offset = 0.0
+            self._stalker_audio_start_time = None
+            self._play_stalker_audio()
+        except discord.ClientException:
+            # Already connected somewhere, move instead
+            if self._stalker_voice_client and self._stalker_voice_client.is_connected():
+                await self._stalker_move_channel(channel)
+        except Exception as e:
+            self.gui.log_console(f"[Stalker] Failed to join voice: {e}", "error")
+    
+    async def _stalker_move_channel(self, channel: discord.VoiceChannel) -> None:
+        """Move to a different channel while preserving audio state."""
+        import time
+        
+        if not self._stalker_voice_client:
+            await self._stalker_join_channel(channel)
+            return
+        
+        # Check if we were playing and calculate current position
+        was_playing = self._stalker_voice_client.is_playing()
+        saved_offset = self._stalker_audio_offset
+        
+        if was_playing and self._stalker_audio_start_time is not None:
+            elapsed = time.time() - self._stalker_audio_start_time
+            # Add elapsed time to existing offset, wrap around using modulo
+            saved_offset = self._stalker_audio_offset + elapsed
+            # Don't use modulo - just let it accumulate and FFmpeg will handle it
+            # (FFmpeg will start from beginning if seek is past end)
+            self._stalker_voice_client.stop()
+        
+        self._stalker_audio_offset = saved_offset
+        
+        try:
+            await self._stalker_voice_client.move_to(channel)
+            self.gui.log_console(f"[Stalker] Keith followed to #{channel.name}", "info")
+            
+            # Resume playback from saved position
+            if was_playing or self.stalker_mode_active:
+                self._play_stalker_audio(seek_to=saved_offset)
+        except Exception as e:
+            self.gui.log_console(f"[Stalker] Failed to move: {e}", "error")
+    
+    async def _stalker_disconnect(self) -> None:
+        """Disconnect from voice when target leaves (but keep stalker mode active)."""
+        if self._stalker_voice_client:
+            if self._stalker_voice_client.is_playing():
+                self._stalker_voice_client.stop()
+            if self._stalker_voice_client.is_connected():
+                await self._stalker_voice_client.disconnect()
+            self._stalker_voice_client = None
+        # Keep stalker_mode_active = True so we continue tracking
+        # Reset audio state since we disconnected
+        self._stalker_audio_offset = 0.0
+        self._stalker_audio_start_time = None
+        self.gui.log_console("[Stalker] Keith disconnected - waiting for target to rejoin...", "info")
+    
+    def _get_audio_duration(self) -> float:
+        """Get the duration of dd.mp3 in seconds (cached)."""
+        if not hasattr(self, '_stalker_audio_duration'):
+            # Default to 60 seconds if we can't determine duration
+            self._stalker_audio_duration = 60.0
+        return self._stalker_audio_duration
+    
+    def _play_stalker_audio(self, seek_to: float = 0.0) -> None:
+        """Play/loop dd.mp3 for Stalker Mode, optionally seeking to a position."""
+        import time
+        
+        if not self.stalker_mode_active or not self._stalker_voice_client:
+            return
+        
+        if not self._stalker_voice_client.is_connected():
+            return
+        
+        audio_path = Path(__file__).parent / "audio" / "dd.mp3"
+        if not audio_path.exists():
+            self.gui.log_console(f"[Stalker] Audio file not found: {audio_path}", "error")
+            return
+        
+        def after_playback(error):
+            if error:
+                logger.error(f"Stalker playback error: {error}")
+            # Reset offset and start time when track finishes naturally (for clean loop)
+            self._stalker_audio_offset = 0.0
+            self._stalker_audio_start_time = None
+            # Loop: schedule next play if still active
+            if self.stalker_mode_active and self._stalker_voice_client:
+                asyncio.run_coroutine_threadsafe(
+                    self._schedule_stalker_loop(),
+                    self.loop
+                )
+        
+        try:
+            # Build FFmpeg options with seek if needed
+            # Use before_options for -ss (input seeking is faster)
+            before_opts = f'-ss {seek_to:.2f}' if seek_to > 0.5 else None
+            
+            if Config.FFMPEG_PATH:
+                ffmpeg_exe = os.path.join(Config.FFMPEG_PATH, "ffmpeg.exe")
+                if before_opts:
+                    audio_source = discord.FFmpegPCMAudio(str(audio_path), executable=ffmpeg_exe, before_options=before_opts)
+                else:
+                    audio_source = discord.FFmpegPCMAudio(str(audio_path), executable=ffmpeg_exe)
+            else:
+                if before_opts:
+                    audio_source = discord.FFmpegPCMAudio(str(audio_path), before_options=before_opts)
+                else:
+                    audio_source = discord.FFmpegPCMAudio(str(audio_path))
+            
+            # Track when playback started (accounting for seek offset)
+            self._stalker_audio_start_time = time.time()
+            if seek_to > 0.5:
+                self.gui.log_console(f"[Stalker] Resuming audio at {seek_to:.1f}s", "info")
+            self._stalker_voice_client.play(audio_source, after=after_playback)
+        except Exception as e:
+            self.gui.log_console(f"[Stalker] Audio error: {e}", "error")
+    
+    async def _schedule_stalker_loop(self) -> None:
+        """Schedule the next loop of Stalker audio."""
+        if self.stalker_mode_active and self._stalker_voice_client:
+            self._play_stalker_audio()
+    
+    async def _stalker_start(self, target_id: int) -> None:
+        """Start Stalker Mode targeting a specific user."""
+        self.stalker_target_id = target_id
+        self.stalker_mode_active = True
+        self._stalker_audio_offset = 0.0
+        self._stalker_audio_start_time = None
+        
+        # Check if target is already in a voice channel
+        for guild in self.guilds:
+            member = guild.get_member(target_id)
+            if member and member.voice and member.voice.channel:
+                self.gui.log_console(f"[Stalker] Target {member.display_name} is already in #{member.voice.channel.name}", "warning")
+                await self._stalker_join_channel(member.voice.channel)
+                return
+        
+        self.gui.log_console(f"[Stalker] Waiting for target (ID: {target_id}) to join voice...", "info")
+    
+    async def _stalker_stop(self) -> None:
+        """Stop Stalker Mode."""
+        self.stalker_mode_active = False
+        self.stalker_target_id = None
+        
+        if self._stalker_voice_client:
+            if self._stalker_voice_client.is_playing():
+                self._stalker_voice_client.stop()
+            if self._stalker_voice_client.is_connected():
+                await self._stalker_voice_client.disconnect()
+            self._stalker_voice_client = None
+        
+        self._stalker_audio_offset = 0.0
+        self._stalker_audio_start_time = None
+        self.gui.log_console("[Stalker] Mode deactivated", "success")
     
     async def _handle_keith_smart(self, message: discord.Message) -> None:
         """Handle messages mentioning Keith with AI relevance check."""
@@ -623,6 +818,10 @@ class KeithBot(discord.Client):
                     await self._super_server_start()
                 elif action == "super_server_stop":
                     await self._super_server_stop()
+                elif action == "stalker_start":
+                    await self._stalker_start(args.get("target_id"))
+                elif action == "stalker_stop":
+                    await self._stalker_stop()
                 self._action_queue.task_done()
             except queue.Empty:
                 await asyncio.sleep(0.1)
@@ -925,6 +1124,7 @@ class KeithGUI(ctk.CTk):
         "tomato": "\u2764",     # Heart (tomato substitute)
         "speaker": "\u266B",    # Music note
         "brain": "\u2605",      # Star (brain substitute)
+        "stalker": "\u2316",    # Crosshair/target
     }
     
     def __init__(self):
@@ -1290,10 +1490,21 @@ class KeithGUI(ctk.CTk):
         """Create the memes view with Tomato Town and Super Server controls."""
         self.memes_view = ctk.CTkFrame(self.view_container, fg_color="transparent")
         self.memes_view.grid_columnconfigure(0, weight=1)
+        self.memes_view.grid_rowconfigure(0, weight=1)
+        
+        # Scrollable container for memes content
+        self.memes_scroll = ctk.CTkScrollableFrame(
+            self.memes_view,
+            fg_color="transparent",
+            scrollbar_button_color=Theme.BG_HIGHLIGHT,
+            scrollbar_button_hover_color=Theme.BORDER
+        )
+        self.memes_scroll.grid(row=0, column=0, sticky="nsew")
+        self.memes_scroll.grid_columnconfigure(0, weight=1)
         
         # Title
         self.memes_title = ctk.CTkLabel(
-            self.memes_view,
+            self.memes_scroll,
             text=f"{self.ICONS['memes']} Meme Controls",
             font=("Arial", 20, "bold"),
             text_color=Theme.TEXT_PRIMARY
@@ -1302,7 +1513,7 @@ class KeithGUI(ctk.CTk):
         
         # === Tomato Town Card ===
         self.tomato_card = ctk.CTkFrame(
-            self.memes_view,
+            self.memes_scroll,
             fg_color=Theme.BG_SURFACE,
             corner_radius=12,
             border_width=1,
@@ -1378,7 +1589,7 @@ class KeithGUI(ctk.CTk):
         
         # === Super Server Card ===
         self.super_card = ctk.CTkFrame(
-            self.memes_view,
+            self.memes_scroll,
             fg_color=Theme.BG_SURFACE,
             corner_radius=12,
             border_width=1,
@@ -1427,6 +1638,80 @@ class KeithGUI(ctk.CTk):
             state="disabled"
         )
         self.super_server_btn.grid(row=2, column=0, columnspan=2, sticky="w", padx=20, pady=(0, 20))
+        
+        # === Stalker Mode Card ===
+        self.stalker_card = ctk.CTkFrame(
+            self.memes_scroll,
+            fg_color=Theme.BG_SURFACE,
+            corner_radius=12,
+            border_width=1,
+            border_color=Theme.BORDER
+        )
+        self.stalker_card.grid(row=3, column=0, sticky="ew", pady=(0, 15))
+        self.stalker_card.grid_columnconfigure(1, weight=1)
+        
+        # Stalker icon
+        self.stalker_icon_label = ctk.CTkLabel(
+            self.stalker_card,
+            text=self.ICONS["stalker"],
+            font=("Segoe UI Emoji", 36)
+        )
+        self.stalker_icon_label.grid(row=0, column=0, rowspan=2, padx=20, pady=20)
+        
+        # Stalker title and description
+        self.stalker_title = ctk.CTkLabel(
+            self.stalker_card,
+            text="Stalker Mode",
+            font=("Arial", 16, "bold"),
+            text_color=Theme.TEXT_PRIMARY
+        )
+        self.stalker_title.grid(row=0, column=1, sticky="w", padx=(0, 20), pady=(20, 5))
+        
+        self.stalker_desc = ctk.CTkLabel(
+            self.stalker_card,
+            text="Follow a specific user and play audio whenever they join voice.",
+            font=("Arial", 12),
+            text_color=Theme.TEXT_SECONDARY
+        )
+        self.stalker_desc.grid(row=1, column=1, sticky="w", padx=(0, 20), pady=(0, 5))
+        
+        # Stalker controls
+        self.stalker_controls = ctk.CTkFrame(self.stalker_card, fg_color="transparent")
+        self.stalker_controls.grid(row=2, column=0, columnspan=2, sticky="ew", padx=20, pady=(10, 20))
+        
+        # Target User ID input
+        self.stalker_id_label = ctk.CTkLabel(
+            self.stalker_controls,
+            text="Target User ID:",
+            font=("Arial", 12),
+            text_color=Theme.TEXT_PRIMARY
+        )
+        self.stalker_id_label.pack(side="left", padx=(0, 10))
+        
+        self.stalker_id_entry = ctk.CTkEntry(
+            self.stalker_controls,
+            placeholder_text="Enter Discord User ID...",
+            width=180,
+            fg_color=Theme.BG_DARK,
+            border_color=Theme.BORDER
+        )
+        self.stalker_id_entry.pack(side="left", padx=(0, 15))
+        
+        # Stalker Mode toggle button
+        self.stalker_mode_active = False
+        self.stalker_btn = ctk.CTkButton(
+            self.stalker_controls,
+            text=f"{self.ICONS['stalker']} Start Stalking",
+            command=self._toggle_stalker_mode,
+            width=150,
+            height=40,
+            font=("Arial", 13, "bold"),
+            fg_color=Theme.WARNING,
+            hover_color="#c99a2e",
+            corner_radius=8,
+            state="disabled"
+        )
+        self.stalker_btn.pack(side="left")
     
     def _create_settings_view(self) -> None:
         """Create the settings view with configuration options."""
@@ -1686,6 +1971,7 @@ class KeithGUI(ctk.CTk):
             self.channel_dropdown.configure(state="readonly")
             self.tomato_btn.configure(state="normal")
             self.super_server_btn.configure(state="normal")
+            self.stalker_btn.configure(state="normal")
         else:
             self.connect_btn.configure(
                 text=f"{self.ICONS['connect']} Connect",
@@ -1697,9 +1983,12 @@ class KeithGUI(ctk.CTk):
             self.channel_dropdown.configure(state="disabled")
             self.tomato_btn.configure(state="disabled")
             self.super_server_btn.configure(state="disabled")
-            # Reset super server state if disconnected
+            self.stalker_btn.configure(state="disabled")
+            # Reset states if disconnected
             if self.super_server_active:
                 self._reset_super_server_toggle()
+            if self.stalker_mode_active:
+                self._reset_stalker_mode_toggle()
     
     def populate_channels(self, channels: list[tuple[int, str, str]]) -> None:
         """Populate channel dropdown."""
@@ -1850,6 +2139,56 @@ class KeithGUI(ctk.CTk):
             )
             self.log_console("Stopping Super Server...", "info")
             self.bot.queue_action("super_server_stop")
+    
+    def _toggle_stalker_mode(self) -> None:
+        """Toggle Stalker Mode on/off."""
+        if not self.bot or not self.bot._ready:
+            return
+        
+        if not self.stalker_mode_active:
+            # Validate user ID
+            target_id_str = self.stalker_id_entry.get().strip()
+            if not target_id_str:
+                self.log_console("Please enter a target User ID", "error")
+                return
+            
+            try:
+                target_id = int(target_id_str)
+            except ValueError:
+                self.log_console("Invalid User ID - must be a number", "error")
+                return
+            
+            # Turn ON
+            self.stalker_mode_active = True
+            self.stalker_btn.configure(
+                text=f"{self.ICONS['stalker']} Stop Stalking",
+                fg_color=Theme.BTN_TOMATO,
+                hover_color=Theme.BTN_TOMATO_HOVER
+            )
+            self.stalker_id_entry.configure(state="disabled")
+            self.log_console(f"Starting Stalker Mode for User ID: {target_id}...", "warning")
+            self.bot.queue_action("stalker_start", {"target_id": target_id})
+        else:
+            # Turn OFF
+            self.stalker_mode_active = False
+            self.stalker_btn.configure(
+                text=f"{self.ICONS['stalker']} Start Stalking",
+                fg_color=Theme.WARNING,
+                hover_color="#c99a2e"
+            )
+            self.stalker_id_entry.configure(state="normal")
+            self.log_console("Stopping Stalker Mode...", "info")
+            self.bot.queue_action("stalker_stop")
+    
+    def _reset_stalker_mode_toggle(self) -> None:
+        """Reset the Stalker Mode button to OFF state (called on error or disconnect)."""
+        self.stalker_mode_active = False
+        self.stalker_btn.configure(
+            text=f"{self.ICONS['stalker']} Start Stalking",
+            fg_color=Theme.WARNING,
+            hover_color="#c99a2e"
+        )
+        self.stalker_id_entry.configure(state="normal")
     
     def _reset_super_server_toggle(self) -> None:
         """Reset the Super Server button to OFF state (called on error or disconnect)."""

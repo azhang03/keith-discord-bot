@@ -2,8 +2,6 @@
 
 A desktop application for running an AI-powered Discord bot named "Keith" that uses Anthropic's Claude API.
 
-![Keith Bot GUI](https://via.placeholder.com/800x500?text=Keith+Bot+GUI)
-
 ## Features
 
 *   **Modern GUI Application** - No command line needed, just click to connect
